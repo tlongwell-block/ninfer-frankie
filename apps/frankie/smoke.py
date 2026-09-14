@@ -332,7 +332,7 @@ async def main():
         r = await response("thinking")
         assert "7429" in text(r), r
         await update(
-            thinking="off",
+            thinking="off", output_modalities=["audio"],
             tools=[
                 {
                     "type": "function",
@@ -360,7 +360,8 @@ async def main():
         )
         await until("conversation.item.created")
         r = await response("tool-result")
-        assert "58" in text(r), r
+        assert re.search(r"58|fifty[- ]eight", text(r).lower()), r
+        assert results[-1]["audio_seconds"] > 0, "tool result was not spoken"
         # Keep sending real-time microphone frames while speech is being produced,
         # then interrupt and submit the captured utterance as the next turn.
         await update(

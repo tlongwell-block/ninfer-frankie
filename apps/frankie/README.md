@@ -6,14 +6,17 @@ brain. The Frankie runtime supplies the neural audio encoder, turn prediction,
 listener reactions, expression head, and Breeze speech synthesis. It loads only
 the tokenizer from the speech package's brain component.
 
-This integration is experimental. Host compilation and native Metal speech tests
-have passed; the combined CUDA executable still requires RTX 5090 validation.
+This integration is experimental. The groupwise brain profile passes focused
+RTX 5090 tests for the combined server, including custom WAV voices, neural audio
+input, images, tools, interruption recovery, and concurrent HTTP progress during
+speech. The reused speech runtime also passes native Metal tests.
 Upstream NInfer performance figures do not measure this integration.
 
 ## Build
 
 Use NInfer's Linux/RTX 5090 build prerequisites from the repository README, plus
-the ICU development package. The reusable speech runtime is pinned in the
+the ICU development package and NVTX3 headers available to the compiler. The
+reusable speech runtime is pinned in the
 `frankie/ninfer-runtime` branch of the Frankie llama.cpp fork (commit
 `9860bd25c0d29ce8b27fd9f311a2bce2012c1198`):
 
@@ -57,8 +60,9 @@ Start with modest context allocations for the first CUDA qualification:
 
 `--kv-dtype nvfp4` selects KV cache storage, independently of the brain artifact's
 weight quantization. `--max-context` limits each request; `--kv-capacity` is the
-shared pool. Concurrent requests need enough room for their combined prompt and
-output reservations. Increase the pool after measuring speech and graph memory.
+shared pool, capped by `max-context × max-concurrency`. Concurrent requests need
+enough room for their combined prompt and output reservations. Increase the pool
+after measuring speech and graph memory.
 The combined server uses CUDA device 0; it rejects other `--device` indices
 to keep the brain and speech on the same GPU.
 Automatic KV allocation is disabled for this executable because it would consume
