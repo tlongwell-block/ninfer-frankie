@@ -179,6 +179,10 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
                                         std::make_move_iterator(context.begin()),
                                         std::make_move_iterator(context.end()));
 
+    // Apply after joining stored and new turns so the automatic checkpoint follows the
+    // actual final message, with the same policy and marker budget as Chat Completions.
+    apply_openai_prompt_cache_policy(resolved.generation, request.cache_policy);
+
     if (response_id) {
         if (parent_record) {
             resolved.session_key = parent_record->session_key;

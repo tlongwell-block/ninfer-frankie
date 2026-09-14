@@ -18,8 +18,8 @@
 
 namespace ninfer::runtime {
 
-// Shared publication is optional. Unlike materialization, its incumbent is always Skip and a
-// target is selectable only when the complete post-state has strictly positive net value.
+// Shared publication is optional and must improve the complete post-state. A rolling private
+// rewrite checkpoint instead repairs capacity using the least costly legal inactive victims.
 template <class Package>
 class SharedCapturePlanner {
 public:
@@ -60,6 +60,7 @@ public:
         std::uint32_t blocked_runnable_requests     = 0;
         std::uint32_t stable_scenario_ordinal       = 0;
         std::uint32_t target_budget                 = kTargetBudget;
+        bool private_rewrite                        = false;
     };
 
     struct Result {
@@ -125,7 +126,7 @@ public:
 
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
                 const TransitionValue value = fold_target(input, assessment, machine_cost);
-                if (value.positive &&
+                if ((value.positive || (input.private_rewrite && !value.saturated)) &&
                     (!incumbent || better(value, assessment, input, *incumbent))) {
                     incumbent = Incumbent{
                         .target              = queued.target,
@@ -219,6 +220,7 @@ private:
         std::uint64_t private_loss    = 0;
         std::uint64_t immediate       = 0;
         std::uint64_t gain            = 0;
+        std::uint64_t repair_cost     = 0;
         bool positive                 = false;
         bool saturated                = false;
 
@@ -238,7 +240,11 @@ private:
     };
 
     static void validate(const Input& input) {
-        if (input.capture == nullptr || !input.capture->publishes_shared ||
+        if (input.capture == nullptr ||
+            (input.private_rewrite
+                 ? (!input.capture->publishes_private || !input.capture->rewrite_checkpoint ||
+                    input.capture->publishes_shared)
+                 : !input.capture->publishes_shared) ||
             input.target_budget == 0 || input.target_budget > kTargetBudget ||
             input.private_owners.size() != input.private_owner_ids.size() ||
             input.shared_owners.size() != input.shared_owner_ids.size()) {
@@ -343,14 +349,16 @@ private:
                 .target_recovery_ns   = target_recovery,
             });
         }
-        checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{
-            .owner                = candidate_owner,
-            .demand_mask          = input.candidate_demand_mask,
-            .rebuild_ns           = input.candidate_rebuild_ns,
-            .baseline_recovery_ns = input.candidate_rebuild_ns,
-            .target_recovery_ns   = price_checkpoint_recovery_work(
-                machine_cost, input.capture->projected_recovery_work),
-        });
+        if (!input.private_rewrite) {
+            checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{
+                .owner                = candidate_owner,
+                .demand_mask          = input.candidate_demand_mask,
+                .rebuild_ns           = input.candidate_rebuild_ns,
+                .baseline_recovery_ns = input.candidate_rebuild_ns,
+                .target_recovery_ns   = price_checkpoint_recovery_work(
+                    machine_cost, input.capture->projected_recovery_work),
+            });
+        }
 
         const ContextPortfolioValueResult portfolio =
             portfolio_value_.fold(owner_scratch_, checkpoint_scratch_);
@@ -384,6 +392,9 @@ private:
             .private_loss    = portfolio.private_transition_loss,
             .immediate       = immediate,
             .gain            = positive ? portfolio.target_public_value - threshold : 0,
+            .repair_cost     = threshold > portfolio.target_public_value
+                                   ? threshold - portfolio.target_public_value
+                                   : 0,
             .positive        = positive,
             .saturated       = saturated,
         };
@@ -404,6 +415,12 @@ private:
     [[nodiscard]] static bool better(const TransitionValue& value,
                                      const PressureTargetAssessment& assessment, const Input& input,
                                      const Incumbent& incumbent) noexcept {
+        if (input.private_rewrite) {
+            return std::tuple{value.repair_cost, assessment.degradation_units,
+                              assessment.dropped_checkpoints, assessment.stable_target_ordinal} <
+                   std::tuple{incumbent.value.repair_cost, incumbent.degradation_units,
+                              incumbent.dropped_checkpoints, incumbent.stable_target};
+        }
         return std::tuple{
                    value.gain,
                    std::numeric_limits<std::uint32_t>::max() - assessment.degradation_units,

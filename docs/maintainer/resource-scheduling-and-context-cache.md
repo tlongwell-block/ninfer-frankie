@@ -456,6 +456,13 @@ TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，�
 inactive owners，但只有严格优于 private-only baseline 的完整终态才会提交；否则跳过 shared publication，
 不阻塞 active request，也不改变同一 frontier 原本可执行的 private capture。
 
+A private TurnClosure rewrite checkpoint has a separate fallback when its state image cannot fit:
+the same bounded capture planner may reclaim inactive cached state at the least complete-post-state
+cost. This protects continuation reuse for newly admitted conversations after image-pool saturation.
+It neither expands configured pools nor reclaims active/borrowed/pinned state. Other optional private
+anchors retain skip semantics. If no legal target fits within the search budget, capture still skips
+and the active request continues.
+
 ### 6.3 Persistent backfill proof
 
 Scheduler 是否允许 backfill 由 [Engine 架构](engine-architecture.md#52-admission-顺序)决定。Program
@@ -737,6 +744,8 @@ lane 或 open transaction 阻塞，结果为 temporarily blocked。
 
 Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证
 identity 或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
+The private-rewrite fallback uses that same typed capture entrypoint and budget, but selects the
+least costly legal repair without requiring the new private checkpoint to create shared value.
 
 一次 planning problem 中：
 

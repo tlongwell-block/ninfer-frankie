@@ -7413,6 +7413,7 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
         validated_rebuild_work(group.identity->rebuild_work, group.frontier);
     assessment.frontier          = group.frontier;
     assessment.publishes_private = publish_private;
+    assessment.rewrite_checkpoint = group.rewrite.has_value();
     assessment.publishes_shared  = publish_shared;
     if (!publish_private && !publish_shared) {
         if (private_replacement) {
@@ -7712,7 +7713,8 @@ ProgramImplCore::checkpoint_recovery_work(const SharedPrefixHandle& owner,
 
 std::unique_ptr<CapturePressureCandidateImpl>
 ProgramImplCore::make_capture_physical_candidate(const CaptureAssessment& assessment) const {
-    if (assessment.implementation == nullptr || !assessment.publishes_shared ||
+    if (assessment.implementation == nullptr ||
+        (!assessment.publishes_shared && !assessment.rewrite_checkpoint) ||
         assessment.frontier == 0) {
         throw std::invalid_argument("capture pressure candidate is incomplete");
     }

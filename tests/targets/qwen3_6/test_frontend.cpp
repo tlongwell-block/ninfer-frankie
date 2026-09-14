@@ -1160,6 +1160,68 @@ int test_official_resource_guards() {
     return failures;
 }
 
+int test_shared_message_and_rolling_frontiers(const Frontend& frontend) {
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage result;
+        result.role = role;
+        result.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return result;
+    };
+    int failures = 0;
+    for (const bool thinking : {false, true}) {
+        for (const bool preserve : {false, true}) {
+            for (const bool next_turn : {false, true}) {
+                ninfer::PromptInput input;
+                input.options.enable_thinking   = thinking;
+                input.options.preserve_thinking = preserve;
+                input.messages.push_back(message(ninfer::ChatRole::User, "Look up x."));
+                auto call              = message(ninfer::ChatRole::Assistant, "");
+                call.reasoning_content = "Use the lookup tool.";
+                call.tool_calls.push_back(ninfer::ToolCall{
+                    .id = "call_x", .name = "lookup", .arguments_json = R"({"key":"x"})"});
+                input.messages.push_back(std::move(call));
+                auto result         = message(ninfer::ChatRole::Tool, R"({"value":7})");
+                result.tool_call_id = "call_x";
+                input.messages.push_back(std::move(result));
+                if (next_turn) {
+                    input.messages.push_back(
+                        message(ninfer::ChatRole::Assistant, "The value is seven."));
+                    input.messages.push_back(
+                        message(ninfer::ChatRole::User, "Explain what that means."));
+                }
+                input.context_cache.allow_engine_automatic_shared_prefixes = false;
+                const auto unmarked = frontend.prepare(input);
+                input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                    .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
+                    .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                    .evidence            = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                    .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary});
+                const auto marked    = frontend.prepare(input);
+                const auto replay    = frontend.prepare(input);
+                const auto& original = FrontendFactory::inspect(unmarked);
+                const auto& data     = FrontendFactory::inspect(marked);
+                const auto& repeated = FrontendFactory::inspect(replay);
+                failures += check(
+                    data.token_ids == original.token_ids && data.token_ids == repeated.token_ids,
+                    "implicit full-message caching changed tool history or exact replay");
+                failures += check(
+                    data.context_cache.opportunities.size() == 1 &&
+                        data.identity.rewrite_checkpoint &&
+                        ((next_turn || preserve)
+                             ? data.context_cache.opportunities.front().frontier ==
+                                   data.identity.rewrite_checkpoint->frontier
+                             : data.context_cache.opportunities.front().frontier >
+                                   data.identity.rewrite_checkpoint->frontier) &&
+                        repeated.identity.rewrite_checkpoint->frontier ==
+                            data.identity.rewrite_checkpoint->frontier,
+                    "cache marker changed completed-turn coalescing or current tool-round rewrite");
+            }
+        }
+    }
+    return failures;
+}
+
 int test_text_and_image_prepare(const Frontend& frontend) {
     ninfer::ChatMessage text_message;
     text_message.role = ninfer::ChatRole::User;
@@ -2293,6 +2355,7 @@ int main() {
     failures += test_official_resource_guards();
     failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
+    failures += test_shared_message_and_rolling_frontiers(frontend);
     failures += test_literal_control_tokens_with_media();
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
