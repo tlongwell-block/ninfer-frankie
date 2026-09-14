@@ -64,7 +64,13 @@ modifying the original direct parameters. The verifier checks those parameters
 remain exact, every compressed matrix's stored words and divisors, and original
 MTP/vision/draft representative quantization rows.
 
-Before distributing this experimental quantization, run real CUDA comparisons
+The initial artifact passes focused RTX 5090 checks for MTP 0/3 feature and cache
+alignment, image and neural-ear input, custom-voice speech, interruption, real
+tool calls and concurrent HTTP progress during speech. See the
+[combined server measurements](../../../apps/frankie/README.md#measured-rtx-5090-results).
+These spot checks are not a broad quality evaluation of the quantization.
+
+Before distributing this experimental quantization, run broader CUDA comparisons
 for text, image and neural-ear inputs, speech quality, layer-16 features, MTP,
 and context behavior. Codec and inventory verification does not establish model
 quality or GPU performance. In particular, text-derived activation scales may

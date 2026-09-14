@@ -6,8 +6,8 @@ brain. The Frankie runtime supplies the neural audio encoder, turn prediction,
 listener reactions, expression head, and Breeze speech synthesis. It loads only
 the tokenizer from the speech package's brain component.
 
-This integration is experimental. The groupwise brain profile passes focused
-RTX 5090 tests for the combined server, including custom WAV voices, neural audio
+This integration is experimental. Both the groupwise and calibrated mixed NVFP4
+brain profiles pass focused RTX 5090 tests for the combined server, including custom WAV voices, neural audio
 input, images, tools, interruption recovery, and concurrent HTTP progress during
 speech. The reused speech runtime also passes native Metal tests.
 Upstream NInfer performance figures do not measure this integration.
@@ -140,6 +140,47 @@ Set `FRANKIE_API_KEY` when the server requires authentication. The harness
 executes actual dictionary lookups for HTTP and realtime tool requests and
 checks tool results, unique IDs, conversation memory, images, audio input,
 prosody, interruption recovery, and HTTP progress during speech.
+It also records audio chunk receipt times, maximum/P95 inter-chunk gaps and
+cumulative delivery deficit. These describe delivery timing; they do not model
+an individual player's buffering or establish listening quality.
+
+### Measured RTX 5090 results
+
+The combined server was measured with the full Breeze speech package loaded,
+MTP 3, NVFP4 KV storage, three request lanes and a 131,072-token per-request
+limit. The shared KV pool was 278,528 tokens for groupwise weights and 196,608
+for mixed NVFP4 weights. HTTP prose benchmarks disabled thinking, used seed 123
+and requested up to 256 output tokens. Rates below measure decode separately
+from prefill; outputs and MTP acceptance vary between weight profiles.
+
+| Workload | Groupwise weights | Mixed NVFP4 weights |
+| --- | ---: | ---: |
+| Short prompt decode | 126–127 tok/s | 124 tok/s |
+| 4,099-token prompt decode | 129–130 tok/s | 136 tok/s |
+| 100,925-token prompt decode | 112 tok/s | 107–108 tok/s |
+| 130,725-token prompt decode | 120 tok/s | 100 tok/s |
+| Two concurrent short requests, each | 94 tok/s | 125–127 tok/s |
+| Cold 100,925-token prefill | 77.8 s | 51.2 s |
+
+The mixed NVFP4 run passed all 15 end-to-end harness records. Short speech
+reached first received audio in 123–138 ms; paragraph replies started in
+515–517 ms while two HTTP requests made progress. Those paragraph streams had
+maximum inter-chunk gaps of 121–126 ms and no positive cumulative delivery
+deficit in the measured run. These are LAN receipt timings from `response.create`,
+not microphone-endpoint or physical speaker latency.
+
+Thinking-enabled HTTP tests also executed a real lookup and calculation, then
+answered correctly at short and approximately 101k context. All four call IDs
+were distinct, and the long tool continuations reused over 101k prompt tokens.
+The 130,725-token repeated prose request reused 130,718 tokens and reached first
+content in 156 ms. A separate 100,925-token exact replay missed the cache; these
+measurements do not establish that every repeated request retains its prefix.
+
+The mixed NVFP4 configuration occupied approximately 29.8 GiB of total reported
+GPU memory. This includes the loaded speech components and the allocated KV
+pool. The mixed recipe is larger than groupwise weights and is not a 24 GiB
+configuration. These focused checks do not replace broader model-quality,
+long-duration conversation or workload-specific capacity evaluation.
 
 Before calling a CUDA build validated, exercise text and images, speech input
 and output, a real tool/result round trip in both protocols, interruption and

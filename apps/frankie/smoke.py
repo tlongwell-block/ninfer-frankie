@@ -9,6 +9,7 @@ import wave
 import re
 import os
 import io
+import math
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
@@ -48,6 +49,29 @@ results = []
 def save_results():
     a.output.write_text(json.dumps(results, indent=2))
 
+
+
+def audio_cadence(chunks):
+    """Receive timing, not a playback-underrun test.
+
+    Deficit is elapsed time since the first chunk minus PCM duration delivered before each
+    later arrival. A player may have added buffering; none is assumed by this delivery metric.
+    P95 uses the nearest-rank definition over consecutive nonempty audio chunk receipts.
+    """
+    gaps = [later["received_at"] - earlier["received_at"]
+            for earlier, later in zip(chunks, chunks[1:])]
+    maximum_deficit = supplied = 0.0
+    if chunks:
+        first_at = chunks[0]["received_at"]
+        for chunk in chunks:
+            maximum_deficit = max(maximum_deficit, chunk["received_at"] - first_at - supplied)
+            supplied += chunk["duration_seconds"]
+    return {
+        "chunk_count": len(chunks),
+        "max_inter_chunk_gap_ms": max(gaps) * 1000 if gaps else None,
+        "p95_inter_chunk_gap_ms": sorted(gaps)[math.ceil(0.95 * len(gaps)) - 1] * 1000 if gaps else None,
+        "max_delivery_deficit_ms": maximum_deficit * 1000 if chunks else None,
+    }
 
 
 def http_json(path, body=None, stream=False):
@@ -206,11 +230,14 @@ async def main():
             t = time.monotonic()
             await send(type="response.create")
             frames, events, http_tasks = [], [], []
+            audio_chunks = []
             metrics = first = first_audio_at = last_audio_at = voice_done = r = None
             failure = None
             try:
                 while True:
-                    e = json.loads(await asyncio.wait_for(ws.recv(), 90))
+                    wire_event = await asyncio.wait_for(ws.recv(), 90)
+                    received_at = time.monotonic()
+                    e = json.loads(wire_event)
                     events.append(e["type"])
                     if e["type"] == "error":
                         raise AssertionError(e)
@@ -219,6 +246,8 @@ async def main():
                         if not chunk:
                             continue
                         frames.append(chunk)
+                        audio_chunks.append({"received_at": received_at, "samples": len(chunk) // 2,
+                                             "duration_seconds": len(chunk) / 48000})
                         last_audio_at = time.monotonic()
                         if first is None:
                             first_audio_at = last_audio_at
@@ -247,6 +276,8 @@ async def main():
                 "last_audio_at": last_audio_at,
                 "voice_done_at": voice_done,
                 "audio_seconds": sum(map(len, frames)) / 48000,
+                "audio_chunks": audio_chunks,
+                "audio_cadence": audio_cadence(audio_chunks),
                 "response": r,
                 "metrics": metrics,
                 "events": events,
@@ -265,7 +296,7 @@ async def main():
                 results.append(result)
             # Persist speech and every concurrent task before any overlap/correctness assertion.
             save_results()
-            print(json.dumps(row), flush=True)
+            print(json.dumps({k: v for k, v in row.items() if k != "audio_chunks"}), flush=True)
             if failure:
                 raise failure
             assert r["status"] == "completed", r
