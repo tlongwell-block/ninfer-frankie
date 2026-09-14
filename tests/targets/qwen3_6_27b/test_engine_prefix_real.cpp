@@ -1173,6 +1173,55 @@ enum class RewriteCheckpointCacheTopology : std::uint8_t {
     SharedAlias,
 };
 
+int exercise_immutable_base_promotion(const char* artifact) {
+    ninfer::EngineOptions configured = engine_options(artifact);
+    configured.enable_vision                                  = false;
+    configured.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(std::move(configured));
+    ninfer::PromptInput input;
+    input.options.enable_thinking = false;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    std::string context;
+    for (int index = 0; index < 128; ++index) {
+        context += "The archive contains blue notebooks and green pencils. ";
+    }
+    context += "Describe the archive in one sentence.";
+    user.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(context), .media = {}});
+    input.messages.push_back(std::move(user));
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 16;
+    request.execution.sampling.temperature    = 0.0F;
+    request.stop.include_model_defaults       = false;
+    const auto initial = engine.generate(engine.prepare(input), request);
+    if (initial.generated_token_ids.size() != 16) {
+        throw std::runtime_error("private checkpoint source did not complete");
+    }
+    // A normal private rewrite checkpoint is now the reusable base. Explicitly requesting
+    // a shared boundary at that same position must not reserve a capture on its pending Fork.
+    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .after_message_count = 1,
+        .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence            = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+    });
+    const auto before = engine.runtime_stats();
+    std::vector<ninfer::TokenId> previous;
+    for (int replay = 0; replay < 3; ++replay) {
+        const auto result = engine.generate(engine.prepare(input), request);
+        if (result.reused_prompt_tokens == 0 || result.generated_token_ids.size() != 16 ||
+            (!previous.empty() && previous != result.generated_token_ids)) {
+            throw std::runtime_error("shared promotion broke an immutable-base replay");
+        }
+        previous = result.generated_token_ids;
+    }
+    if (engine.runtime_stats().state_forks <= before.state_forks) {
+        throw std::runtime_error("immutable-base replay did not exercise a StateImage Fork");
+    }
+    return 0;
+}
+
 int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheTopology topology) {
     const bool shared_alias = topology == RewriteCheckpointCacheTopology::SharedAlias;
     const ninfer::RuntimeStats initial_stats = engine.runtime_stats();
@@ -2107,6 +2156,7 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
         }
     }
     if (const int result = exercise_rewrite_branch(artifact); result != 0) { return result; }
+    if (const int result = exercise_immutable_base_promotion(artifact); result != 0) { return result; }
     {
         ninfer::Engine engine(engine_options(artifact));
         if (const int result = exercise_vision(engine); result != 0) { return result; }
@@ -2153,6 +2203,15 @@ int main() {
         std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS nor a Qwen3.8 equivalent is set\n";
         return 77;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "immutable-base-promotion") {
+        const char* artifact = qwen38_groupwise;
+        if (artifact == nullptr || *artifact == '\0') { artifact = qwen38_nvfp4; }
+        if (artifact == nullptr || *artifact == '\0') { artifact = groupwise; }
+        if (artifact == nullptr || *artifact == '\0') { artifact = nvfp4; }
+        const int result = exercise_immutable_base_promotion(artifact);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
     }
     if (scenario != nullptr && std::string_view(scenario) == "stream-observations") {
         const char* artifact = groupwise != nullptr && *groupwise != '\0' ? groupwise : nvfp4;

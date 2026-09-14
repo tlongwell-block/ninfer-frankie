@@ -11472,12 +11472,20 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 staged.capture_groups[staged.next_capture].long_anchor) {
                 throw std::logic_error("zero-prefill capture is not a shared base promotion");
             }
-            if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
-            staged.pending_capture_offer = next_capture_offer_id_;
-            return runtime::PrefillStepResult{
-                .summary = summary,
-                .timing  = timing.finish(),
-            };
+            if (sequence.state.fork_pending) {
+                // The reusable checkpoint still owns the immutable source; the destination
+                // becomes valid only after the first actual prefill/decode write. Keep using
+                // that checkpoint and omit this optional promotion instead of opening a
+                // resource transaction while its Fork is unsettled.
+                ++staged.next_capture;
+            } else {
+                if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
+                staged.pending_capture_offer = next_capture_offer_id_;
+                return runtime::PrefillStepResult{
+                    .summary = summary,
+                    .timing  = timing.finish(),
+                };
+            }
         }
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;

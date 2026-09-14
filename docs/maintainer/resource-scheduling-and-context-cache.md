@@ -456,6 +456,11 @@ TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，�
 inactive owners，但只有严格优于 private-only baseline 的完整终态才会提交；否则跳过 shared publication，
 不阻塞 active request，也不改变同一 frontier 原本可执行的 private capture。
 
+An optional zero-prefill shared promotion is skipped while its reused base has an unsettled
+StateImage Fork. The immutable private source remains reusable; its destination becomes valid only
+after the first actual model write. Skipping promotion must neither settle an unwritten destination
+nor fail the active request.
+
 A private TurnClosure rewrite checkpoint has a separate fallback when its state image cannot fit:
 the same bounded capture planner may reclaim inactive cached state at the least complete-post-state
 cost. This protects continuation reuse for newly admitted conversations after image-pool saturation.
