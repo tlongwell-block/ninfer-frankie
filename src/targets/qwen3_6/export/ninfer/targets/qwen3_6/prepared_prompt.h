@@ -137,6 +137,26 @@ struct PrepareStats {
     std::size_t reused_patch_bytes       = 0;
 };
 
+struct EmbeddingRowIdentity {
+    std::uint32_t position = 0;
+    std::uint32_t width = 0;
+    std::array<std::uint8_t, 32> digest{};
+    friend bool operator==(const EmbeddingRowIdentity&, const EmbeddingRowIdentity&) = default;
+};
+
+struct PreparedEmbeddingSpan {
+    std::uint32_t begin = 0;
+    std::uint32_t width = 0;
+    std::vector<std::uint16_t> values; // BF16 rows, contiguous [tokens,hidden].
+};
+
+struct PromptLogitProbe {
+    std::vector<TokenId> token_ids;
+    std::vector<float> logits;
+    bool capture_tail = false;
+    CommittedTokenFeatures features;
+};
+
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
     std::vector<std::uint8_t> token_types;
@@ -145,6 +165,10 @@ struct PreparedPromptData {
     // One immutable payload per Vision item, in the same order as vision_items.
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
     std::vector<VisionItem> vision_items;
+    std::vector<PreparedEmbeddingSpan> embeddings;
+    std::vector<EmbeddingRowIdentity> embedding_identity;
+    std::shared_ptr<PromptLogitProbe> logit_probe;
+    bool capture_hidden = false;
     PromptIdentity identity;
     PreparedContextCache context_cache;
     std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
@@ -166,6 +190,7 @@ struct PreparedPromptData {
 class PreparedPromptAccess {
 public:
     [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);
+    [[nodiscard]] static PreparedPromptData& mutable_view(PreparedPrompt& prompt);
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
 };
 

@@ -98,6 +98,9 @@ struct ProcessorOptions {
     int video_max_frames                   = 768;
 };
 
+// Shared by ordinary preprocessing and composition of already prepared media.
+void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options);
+
 struct ProcessedInput {
     std::vector<int> input_ids;
     std::vector<std::uint8_t> token_types;

@@ -76,7 +76,7 @@ constexpr ModelSamplingDefaults kQwen3_8Defaults{
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
     if (model == model_id) { return kQwen3_6Defaults; }
-    if (model == qwen3_8_model_id) { return kQwen3_8Defaults; }
+    if (model == qwen3_8_model_id || model == frankie_model_id) { return kQwen3_8Defaults; }
     throw std::runtime_error("model '" + std::string(model) +
                              "' has no sampling defaults in target package '" +
                              std::string(target_key) + "'");
@@ -86,7 +86,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::Qwen36GroupwiseInt;
     }
-    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int") {
+    if ((identity.model_id == qwen3_8_model_id || identity.model_id == frankie_model_id) &&
+        identity.weights_id == "groupwise-int") {
         return WeightsProfile::Qwen38GroupwiseInt;
     }
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {

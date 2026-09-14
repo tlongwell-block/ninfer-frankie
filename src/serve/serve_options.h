@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -45,6 +46,8 @@ struct ServeOptions {
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
+    // Embedders can request target features; ordinary HTTP serving leaves this disabled.
+    std::optional<std::uint32_t> hidden_layer;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
@@ -65,7 +68,8 @@ struct ServeOptions {
     std::vector<std::string> startup_argv;
 };
 
-ServeOptions parse_serve_options(int argc, char** argv);
+using ExtraOptionParser = std::function<bool(std::string_view, int&, int, char**)>;
+ServeOptions parse_serve_options(int argc, char** argv, const ExtraOptionParser& extra = {});
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_id);
 std::string serve_usage_text(const char* argv0);

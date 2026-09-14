@@ -141,6 +141,24 @@ private:
 
 } // namespace
 
+void TextContext::substitute_embeddings(Tensor& embeddings, std::uint32_t begin, std::uint32_t count) {
+    if (embedded_prompt_ == nullptr) { return; }
+    for (const auto& span : embedded_prompt_->embeddings) {
+        const auto rows = static_cast<std::uint32_t>(span.values.size() / span.width);
+        const auto lo = std::max(begin, span.begin);
+        const auto hi = std::min(begin + count, span.begin + rows);
+        if (hi <= lo) { continue; }
+        if (span.width != kCfg.hidden || embeddings.dtype != DType::BF16) {
+            throw std::logic_error("external embedding shape differs from target");
+        }
+        auto* destination = static_cast<std::byte*>(embeddings.data) + (lo - begin) * embeddings.nb[1];
+        const auto* source = span.values.data() + static_cast<std::size_t>(lo - span.begin) * span.width;
+        const auto row_bytes = span.width * sizeof(std::uint16_t);
+        CUDA_CHECK(cudaMemcpy2DAsync(destination, embeddings.nb[1], source, row_bytes,
+                                    row_bytes, hi - lo, cudaMemcpyHostToDevice, ctx_.stream));
+    }
+}
+
 void DFlashFeatureSink::begin(const Tensor& value) {
     const bool prefill = features != nullptr && positions != nullptr && batch_features == nullptr;
     const bool batch   = batch_features != nullptr && batch_lanes != nullptr &&
@@ -341,7 +359,11 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     } else {
         emb = roots.embedding;
         ops::embedding(flat_ids, *embed_, emb, s);
+        if (mtp_embedding_begin_) {
+            substitute_embeddings(emb, *mtp_embedding_begin_, mtp_embedding_count_);
+        }
     }
+    mtp_embedding_begin_.reset();
 
     Tensor e = roots.normalized_embedding;
     Tensor h = roots.normalized_hidden;
@@ -1055,6 +1077,15 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
+        if (layer == io_.feature_layer && io_.feature_hidden.data != nullptr) {
+            if (x.ne[0] != io_.feature_hidden.ne[0] || x.ne[1] > io_.feature_hidden.ne[1]) {
+                throw std::logic_error("target feature staging capacity exceeded");
+            }
+            io_.feature_columns = x.ne[1];
+            CUDA_CHECK(cudaMemcpyAsync(io_.feature_hidden.data, x.data, x.bytes(),
+                                       cudaMemcpyDeviceToDevice, ctx_.stream));
+        }
+
     }
 }
 
@@ -1195,6 +1226,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
                 ops::scatter(embeddings, indices_device, x, s);
             }
+            substitute_embeddings(x, prompt_t0, static_cast<std::uint32_t>(len));
             if constexpr (Tap::enabled) { tap.begin(x); }
             run_layers(x, Phase::Prefill, tap);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
@@ -1269,7 +1301,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                 shifted_indices, s);
                         }
                     }
+                    // MTP consumes the NEXT input embedding paired with each target hidden row.
+                    substitute_embeddings(mtp_input_embeddings, mtp_window.shifted_embedding_begin,
+                                          static_cast<std::uint32_t>(prompt_columns));
                     mtp_input_embeddings_ptr = &mtp_input_embeddings;
+                }
+                if (embedded_prompt_ != nullptr && !embedded_prompt_->embeddings.empty()) {
+                    mtp_embedding_begin_ = mtp_window.shifted_embedding_begin;
+                    mtp_embedding_count_ = static_cast<std::uint32_t>(prompt_columns);
                 }
                 if (is_last && mtp_proposal_extent_ != 0) {
                     Tensor logits = matrix_window(io_.logits, 1);

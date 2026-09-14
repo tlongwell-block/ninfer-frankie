@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -30,6 +31,22 @@ private:
     std::unique_ptr<Impl> impl_;
 
     friend class Engine;
+};
+
+class PreparedImage {
+public:
+    PreparedImage() noexcept = default;
+    [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
+    [[nodiscard]] explicit operator bool() const noexcept { return impl_ != nullptr; }
+private:
+    class Impl;
+    std::shared_ptr<const Impl> impl_;
+    friend class Engine;
+};
+
+struct RawImageSpan {
+    std::uint32_t begin = 0;
+    PreparedImage image;
 };
 
 class GenerationHandle {
@@ -73,6 +90,28 @@ public:
     // Raw token input is retained for repeatable correctness and performance measurement.
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
+
+    [[nodiscard]] PreparedPrompt prepare_embeddings(std::vector<TokenId> token_ids,
+                                                     std::vector<InputEmbeddingSpan> embeddings,
+                                                     RawPromptOptions options = {},
+                                                     std::vector<RawImageSpan> images = {}) const;
+    [[nodiscard]] PreparedImage prepare_image(OwnedMedia media,
+                                              const PreparationControl& control = {}) const;
+
+    // Evaluate and retain the exact prompt frontier (one sampled bonus is discarded). Unlike
+    // generate(...requested_output_tokens=0), this actually executes a prefill.
+    // Tail features describe newly executed rows only; an exact cache hit returns no features.
+    [[nodiscard]] PromptEvaluation evaluate_prompt(PreparedPrompt prompt,
+                                                   std::vector<TokenId> logit_ids = {},
+                                                   const CancellationView& cancellation = {},
+                                                   bool capture_tail_features = false);
+
+    // Run linked speech CUDA work between brain execution units. The callback must complete its
+    // own GPU work before returning, and must not recursively invoke this Engine.
+    void with_device_idle(const std::function<void()>& work);
+    // Cancel/join this session's requests before discarding. False means a checkpoint is still
+    // borrowed or a resource transaction is in flight; retry after yielding to the worker.
+    [[nodiscard]] bool discard_session(std::string_view session_key);
 
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;

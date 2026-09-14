@@ -28,3 +28,8 @@ target_include_directories(ninfer-perplexity PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${CMAKE_CURRENT_SOURCE_DIR}/perplexity)
 target_link_libraries(ninfer-perplexity PRIVATE ninfer_engine ninfer_product_logging)
+
+option(NINFER_BUILD_FRANKIE "Build the combined Frankie Breeze realtime server" OFF)
+if(NINFER_BUILD_FRANKIE)
+  add_subdirectory(frankie)
+endif()

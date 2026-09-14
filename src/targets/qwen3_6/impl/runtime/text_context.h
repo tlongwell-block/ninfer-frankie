@@ -170,6 +170,9 @@ public:
         proposal_head_n_   = count;
     }
 
+    void set_input_embeddings(const qwen3_6::PreparedPromptData* prompt) noexcept {
+        embedded_prompt_ = prompt;
+    }
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
     void set_prefill_split_frontier(std::int64_t position) noexcept {
@@ -240,6 +243,10 @@ public:
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
 private:
+    const qwen3_6::PreparedPromptData* embedded_prompt_ = nullptr;
+    std::optional<std::uint32_t> mtp_embedding_begin_;
+    std::uint32_t mtp_embedding_count_ = 0;
+    void substitute_embeddings(Tensor& embeddings, std::uint32_t begin, std::uint32_t count);
     void bind();
 
     [[nodiscard]] bool mtp_enabled() const noexcept {

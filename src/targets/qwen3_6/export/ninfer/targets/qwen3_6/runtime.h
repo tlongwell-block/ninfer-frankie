@@ -819,6 +819,7 @@ using ContextTransactionProgress =
                  ActiveCaptureResult<Variant>>;
 
 struct CommitRowResult {
+    CommittedTokenFeatures features;
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
     GenerationTimings timings;
     SpeculativeStats speculative;

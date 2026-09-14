@@ -134,8 +134,13 @@ public:
                                          const PreparationControl& control = {}) const;
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
+    [[nodiscard]] PreparedPrompt prepare_embeddings(std::vector<TokenId> token_ids,
+                                                      std::vector<InputEmbeddingSpan> embeddings,
+                                                      RawPromptOptions options) const;
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
+    // Reapply ordinary aggregate limits when composing separately prepared media.
+    void validate_media_budget(const PromptPreparationStats& stats) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;

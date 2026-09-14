@@ -978,6 +978,7 @@ public:
         publication.handle.emplace(std::move(*result.continuation));
         result.continuation.reset();
         publication.session   = active.session;
+        publication.owner_session = active.session;
         publication.retention = active.retention;
         migrate_observations(publication, result.summary, active.retention);
         advance_revision(publication.revision);
@@ -1121,6 +1122,33 @@ public:
         return lane.value < lane_count_ ? lanes_[lane.value] : LogicalLaneState::Free;
     }
 
+    // Call between execution units after the session's requests have settled.
+    // A retained prefix may still be borrowed by another active request.
+    [[nodiscard]] bool discard_session(Program& program, const CacheSessionKey& session) {
+        if (!std::holds_alternative<std::monostate>(transaction_) ||
+            program.has_context_transaction()) { return false; }
+        for (const ActiveEntry& active : active_) {
+            if (active.occupied && active.session && *active.session == session) { return false; }
+        }
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (!entry.owner_session || *entry.owner_session != session) { continue; }
+            if (entry.state != CatalogState::Catalogued || !entry.handle || private_has_active_edge(slot)) {
+                return false;
+            }
+        }
+        for (CatalogEntry& entry : catalog_) {
+            if (!entry.owner_session || *entry.owner_session != session) { continue; }
+            const auto result = program.release_continuation(std::move(*entry.handle));
+            if (result.status != ConsumeStatus::Consumed) {
+                throw std::runtime_error("session checkpoint release invariant mismatch");
+            }
+            erase_session_if_owner(entry.id);
+            clear_catalog_entry(entry);
+        }
+        return true;
+    }
+
     void clear_after_program_cleanup() noexcept {
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
@@ -1157,6 +1185,7 @@ private:
         ContinuationSummary summary;
         std::optional<ContinuationHandle> handle;
         std::optional<CacheSessionKey> session;
+        std::optional<CacheSessionKey> owner_session; // Kept when a newer endpoint replaces the session binding.
         std::vector<CheckpointObservation> observations;
         RetentionClass retention = RetentionClass::RecentPrivate;
     };
@@ -1557,6 +1586,7 @@ private:
         entry.summary.active_references = 0;
         entry.handle.reset();
         entry.session.reset();
+        entry.owner_session.reset();
         entry.observations.clear();
         entry.retention = RetentionClass::RecentPrivate;
         advance_revision(entry.revision);
@@ -2893,6 +2923,7 @@ private:
         publication.state         = CatalogState::ReservedForActive;
         publication.id            = next_continuation_id_++;
         publication.session       = record->session;
+        publication.owner_session = record->session;
         publication.retention     = record->retention;
         advance_revision(publication.revision);
         if (publication.id == 0) { publication.id = next_continuation_id_++; }

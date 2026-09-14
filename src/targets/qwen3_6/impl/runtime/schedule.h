@@ -139,7 +139,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                                     std::span<const TokenId> ids,
                                                     std::uint32_t nominal_length,
                                                     std::optional<std::uint32_t> split_frontier,
-                                                    bool finalize_at_end);
+                                                    bool finalize_at_end,
+                                                    const PreparedPromptData* embedded_prompt = nullptr);
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
@@ -154,6 +155,8 @@ struct MtpBridgeInput {
 
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose);
+[[nodiscard]] Tensor external_embedding_at(PrefillContext& state, const PreparedPromptData& prompt,
+                                            std::uint32_t position);
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,

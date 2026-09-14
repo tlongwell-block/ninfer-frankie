@@ -45,6 +45,9 @@ public:
     bool listen();
     void stop();
 
+    // Attach in-process protocol routes before listen().
+    [[nodiscard]] httplib::Server& transport() noexcept { return server_; }
+
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
 
 private:

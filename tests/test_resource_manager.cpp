@@ -2582,6 +2582,50 @@ void test_retained_source_is_protected_until_terminal() {
             "released source did not participate in the sealed pressure plan");
 }
 
+void test_discard_session_releases_demoted_history_only() {
+    FakeManager manager = make_manager(2, 6);
+    FakeProgram program;
+    const FakeCacheSessionKey session{42};
+    const auto base = make_base(42, session, RetentionClass::LiveSession, true);
+    const auto older = start_active(manager, program, 42, base, 10);
+    const auto newer = start_active(manager, program, 42, base, 20);
+    (void)finish_active(manager, program, newer, 16);
+    (void)finish_active(manager, program, older, 16);
+    const auto other = start_active(manager, program, 99,
+        make_base(99, FakeCacheSessionKey{99}, RetentionClass::LiveSession), 30);
+    (void)finish_active(manager, program, other, 16);
+    require(manager.discard_session(program, FakeCacheSessionKey{404}) && program.released_continuations.empty(),
+            "unknown session discard altered cached requests");
+    require(manager.discard_session(program, session), "settled session discard did not complete");
+    require(program.released_continuations.size() == 2,
+            "session discard missed an anonymous older endpoint or released another session");
+    const auto cold = manager.inspect(program, FakePreparedPrompt{42}, base, 40);
+    require(cold.choice && cold.choice->summary().reusable_prompt_tokens == 0,
+            "discarded history remained reusable");
+    const auto hot = manager.inspect(program, FakePreparedPrompt{99}, make_base(99, FakeCacheSessionKey{99}), 50);
+    require(hot.choice && hot.choice->summary().reusable_prompt_tokens == 16,
+            "discarding one session invalidated another session's prefix");
+    require(manager.discard_session(program, session) && program.released_continuations.size() == 2,
+            "repeated discard released a continuation twice");
+}
+
+void test_discard_session_waits_for_borrowed_source() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey source_session{1}, borrower_session{2};
+    const auto seed = start_active(manager, program, 9,
+        make_base(9, source_session, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, seed);
+    const auto fork = start_active(manager, program, 9,
+        make_base(9, borrower_session, RetentionClass::LiveSession), 2);
+    require(!manager.discard_session(program, source_session) &&
+            !manager.discard_session(program, borrower_session) && program.released_continuations.empty(),
+            "session discard released active state or a borrowed prefix");
+    (void)manager.abort(program, fork.lane, fork.sequence);
+    require(manager.discard_session(program, source_session) && program.released_continuations.size() == 1,
+            "settled borrowed prefix could not be released");
+}
+
 void test_session_publication_order_controls_tied_source() {
     FakeManager manager = make_manager(2, 3);
     FakeProgram program;
@@ -3486,6 +3530,8 @@ int main() {
              test_aborted_source_selection_does_not_create_hit_history);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
     run_test("session publication order", test_session_publication_order_controls_tied_source);
+    run_test("discard session history", test_discard_session_releases_demoted_history_only);
+    run_test("discard borrowed session", test_discard_session_waits_for_borrowed_source);
     run_test("canonical pressure", test_canonical_pressure_starts_with_disposable_owner);
     run_test("all preserving pressure alternatives",
              test_pressure_tries_every_preserving_alternative_before_eviction);

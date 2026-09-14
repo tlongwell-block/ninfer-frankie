@@ -166,6 +166,9 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    // Disabled by default; Frankie selects layer 16. Reserves a bounded prefill/decode staging
+    // buffer and captures this target layer before final normalization.
+    std::optional<std::uint32_t> hidden_layer;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
@@ -482,6 +485,25 @@ struct ContextCacheHints {
     bool update_session_index = true;
 };
 
+// Sparse, owned replacements for the brain's token embeddings. Values are row-major FP32;
+// preparation rounds once to BF16 and binds the exact executed rows into cache identity.
+struct InputEmbeddingSpan {
+    std::uint32_t begin = 0;
+    std::uint32_t width = 0;
+    std::vector<float> values;
+};
+
+struct RawPromptOptions {
+    std::optional<std::string> session_key;
+    bool enable_thinking = false;
+    bool allow_prefix_identity = true;
+    // Save a complete native KV/recurrent/MTP prefix at this token frontier.
+    std::optional<std::uint32_t> rewrite_checkpoint;
+    // Prior precommit boundaries retained in the logical session. They preserve the native
+    // recurrent-state execution decomposition when a later request extends an audio prefix.
+    std::vector<std::uint32_t> rewrite_execution_frontiers;
+};
+
 struct PromptInput {
     std::vector<ChatMessage> messages;
     PromptOptions options;
@@ -590,6 +612,19 @@ struct GenerationTimingObservation {
     std::uint64_t generation_elapsed_ns = 0;
 };
 
+struct CommittedTokens {
+    std::uint32_t begin = 0; // Absolute token position, including prompt.
+    std::vector<TokenId> token_ids;
+};
+
+struct CommittedTokenFeatures {
+    std::uint32_t begin = 0;
+    std::uint32_t width = 0;
+    std::uint32_t layer = 0; // Zero-based layer OUTPUT, before the next layer's norm.
+    std::vector<TokenId> token_ids;
+    std::vector<float> values; // Row-major, only executed and committed target tokens.
+};
+
 class OutputSink {
 public:
     virtual ~OutputSink()                                   = default;
@@ -597,6 +632,8 @@ public:
     virtual void progress(PromptProgress progress)          = 0;
     virtual void timing(GenerationTimingObservation timing) = 0;
     virtual void publish(OutputDelta delta)                 = 0;
+    virtual void tokens(CommittedTokens) {}
+    virtual void features(CommittedTokenFeatures) {}
 };
 
 enum class OutputConsumerMode : std::uint8_t {
@@ -604,13 +641,18 @@ enum class OutputConsumerMode : std::uint8_t {
     Streaming,
 };
 
-// Observation affects only request publication. It never changes model execution, output
-// semantics, scheduling, or cache selection. Live observations require a Streaming consumer;
+// Observation preserves model outputs and cache selection. Optional consumer credits pause only
+// this lane when its publication queue is full. Live observations require a Streaming consumer;
 // phase timings may also be retained for an Aggregate terminal response.
 struct GenerationObservationOptions {
     bool phase_timings   = false;
     bool live_timings    = false;
     bool prompt_progress = false;
+    bool token_ids = false;
+    bool hidden_features = false;
+    // Zero leaves ordinary HTTP output unthrottled. A voice consumer grants credits only after
+    // token callbacks return; one admitted speculative round can exceed this bound.
+    std::uint32_t max_queued_tokens = 0;
 };
 
 class CancellationView {
@@ -789,6 +831,9 @@ struct MaterializationDiagnostics {
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
+    // Absolute model-history boundaries created during this response (e.g. a thinking-budget
+    // close). Raw session adapters preserve these when reconstructing subsequent prompts.
+    std::vector<std::uint32_t> execution_frontiers;
     std::string content;
     std::string reasoning;
     std::vector<GeneratedToolCall> tool_calls;
@@ -880,8 +925,13 @@ struct RuntimeHostWorkStats {
     std::uint64_t stats_publication_invocations = 0;
 };
 
-// Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
-// decision observations. Consumers derive interval counters by subtracting two snapshots.
+struct PromptEvaluation {
+    GenerationResult generation;
+    std::vector<float> logits;
+    CommittedTokenFeatures features;
+};
+
+// Monotonic execution counters; interval counters are differences between snapshots.
 struct RuntimeStats {
     RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.

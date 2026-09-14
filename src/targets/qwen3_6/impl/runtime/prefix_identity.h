@@ -33,6 +33,7 @@ private:
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;
     std::vector<VisionItem> vision_items_;
+    std::vector<EmbeddingRowIdentity> embedding_identity_;
     std::vector<std::uint32_t> rewrite_execution_frontiers_;
 };
 

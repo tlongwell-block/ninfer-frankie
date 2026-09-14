@@ -549,6 +549,74 @@ int test_bounded_tokenizer_prefix() {
                  "bounded tokenizer output is not the exact prefix of unbounded tokenization");
 }
 
+int test_external_embeddings() {
+    const Frontend frontend = FrontendFactory::create_component(resources(), false);
+    ninfer::RawPromptOptions options;
+    options.session_key = "voice-test";
+    options.rewrite_execution_frontiers = {1};
+    options.rewrite_checkpoint = 3;
+    auto prepared = frontend.prepare_embeddings({0,0,0,0},
+        {{1, 2, {1.00390625F, -2.0F, 0.5F, 0.75F}}}, options);
+    const auto& data = FrontendFactory::inspect(prepared);
+    int failures = check(data.embeddings.size() == 1 && data.embedding_identity.size() == 2 &&
+        data.embeddings[0].values == std::vector<std::uint16_t>{0x3f80,0xc000,0x3f00,0x3f40} &&
+        data.identity.rewrite_execution_frontiers == std::vector<std::uint32_t>{1,3} &&
+        data.context_cache.session_key->view() == "voice-test",
+        "external embeddings changed BF16 rounding, positions or session checkpoint identity");
+    const auto rejected = [&](std::vector<ninfer::InputEmbeddingSpan> spans) {
+        try { (void)frontend.prepare_embeddings({0,0,0,0}, std::move(spans), {}); }
+        catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    failures += check(rejected({{1,2,{0.0F}}}), "accepted partial embedding row");
+    failures += check(rejected({{4,1,{0.0F}}}), "accepted embedding beyond prompt");
+    failures += check(rejected({{1,1,{0.0F,1.0F}},{2,1,{2.0F}}}), "accepted overlapping audio spans");
+    failures += check(rejected({{1,1,{std::numeric_limits<float>::quiet_NaN()}}}), "accepted nonfinite embedding");
+    return failures;
+}
+
+int test_prepared_media_aggregate_budget() {
+    ninfer::targets::qwen3_6::FrontendOptions options;
+    options.max_context = 16;
+    const Frontend frontend = FrontendFactory::create_component(resources(), options);
+    ninfer::PromptPreparationStats aggregate;
+    aggregate.media_items = 2;
+    aggregate.media_bytes = ninfer::kMaximumPromptMediaBytes;
+    aggregate.raw_patches = 64;
+    aggregate.vision_tokens = 16;
+    frontend.validate_media_budget(aggregate); // Two individually valid images exactly fill it.
+    const auto rejected = [&](ninfer::PromptPreparationStats stats) {
+        try { frontend.validate_media_budget(stats); }
+        catch (const ninfer::RequestError& error) {
+            return error.kind() == ninfer::RequestErrorKind::MediaBudgetExceeded;
+        }
+        return false;
+    };
+    auto excessive = aggregate;
+    excessive.raw_patches += 32;
+    excessive.vision_tokens += 8;
+    int failures = check(rejected(excessive), "prepared images bypassed aggregate vision budget");
+    excessive = aggregate;
+    ++excessive.media_bytes;
+    failures += check(rejected(excessive), "prepared images bypassed aggregate encoded-byte budget");
+    excessive = aggregate;
+    ++excessive.raw_patches;
+    failures += check(rejected(excessive), "prepared images bypassed aggregate raw-patch budget");
+    excessive = aggregate;
+    ++excessive.vision_tokens;
+    failures += check(rejected(excessive), "prepared images bypassed aggregate token budget");
+    excessive = aggregate;
+    excessive.media_items = 17;
+    failures += check(rejected(excessive), "prepared images bypassed minimum item extent budget");
+    Frontend moved_from = frontend;
+    const Frontend owner = std::move(moved_from);
+    bool empty_rejected = false;
+    try { moved_from.validate_media_budget(aggregate); }
+    catch (const std::logic_error&) { empty_rejected = true; }
+    failures += check(empty_rejected, "moved-from frontend media validation did not reject cleanly");
+    return failures;
+}
+
 int test_context_capacity_guard() {
     ninfer::PromptInput input;
     ninfer::ChatMessage message;
@@ -2214,6 +2282,8 @@ int main() {
     failures += test_repeated_special_tokens_scan_linearly();
     failures += test_bounded_tokenizer_prefix();
     failures += test_context_capacity_guard();
+    failures += test_external_embeddings();
+    failures += test_prepared_media_aggregate_budget();
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();
     failures += test_assistant_continuation();

@@ -246,6 +246,11 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     if (prompt.has_media() && !vision_enabled) {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
+    for (const auto& span : prompt.embeddings) {
+        if (span.width != TextConfig::hidden) {
+            throw std::invalid_argument("input embedding width differs from target hidden width");
+        }
+    }
     validate_sampling(options.sampling);
 
     auto base                             = std::make_unique<RequestBasePlanImpl>();
