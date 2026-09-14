@@ -623,6 +623,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                     continue;
                 }
                 unique.push_back(state);
+                if (!state_exclusive_to_sequence(*source, state)) { continue; }
                 const StateReplicaResidency residency = state_store->residency(state);
                 if (residency == StateReplicaResidency::DeviceOnly ||
                     residency == StateReplicaResidency::Both) {

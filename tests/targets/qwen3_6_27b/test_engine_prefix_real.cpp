@@ -1173,6 +1173,106 @@ enum class RewriteCheckpointCacheTopology : std::uint8_t {
     SharedAlias,
 };
 
+int exercise_endpoint_shared_rewrite(const char* artifact, bool evict_shared = false) {
+    ninfer::EngineOptions configured = engine_options(artifact);
+    // One active Device state forces the rewrite snapshot onto Host. The explicit
+    // shared boundary aliases that snapshot instead of allocating a second copy.
+    configured.enable_vision = false;
+    configured.max_context = evict_shared ? 960 : 1024;
+    configured.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(configured.max_context);
+    configured.context_cache.device_state_slots = 0;
+    configured.context_cache.host_kv_capacity_bytes = 0;
+    configured.context_cache.host_state_slots = 4;
+    configured.context_cache.max_private_continuations = 2;
+    configured.context_cache.max_shared_prefixes = 1;
+    configured.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(std::move(configured));
+    ninfer::PromptInput input;
+    input.options.enable_thinking = false;
+    input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+    input.context_cache.session_key = "endpoint-shared-rewrite";
+    input.context_cache.allow_engine_automatic_shared_prefixes = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"lookup","description":"Look up a value.","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})");
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "", .media = {}});
+    input.messages.push_back(std::move(user));
+    const std::string question = " Use lookup to find key alpha, then report its value.";
+    bool exact = false;
+    for (int words = 0; words < 768; ++words) {
+        input.messages[0].parts[0].text = std::string();
+        for (int index = 0; index < words; ++index) {
+            input.messages[0].parts[0].text += " archive";
+        }
+        input.messages[0].parts[0].text += question;
+        const auto count = engine.count_tokens(input);
+        if (count == 768) { exact = true; break; }
+        if (count > 768) { break; }
+    }
+    if (!exact) { throw std::runtime_error("endpoint fixture cannot establish exact prompt size"); }
+    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .after_message_count = 1,
+        .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .location = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+    });
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 128;
+    request.execution.sampling.temperature = 0.0F;
+    const auto first = engine.generate(engine.prepare(input), request);
+    if (first.tool_calls.size() != 1 || first.tool_calls[0].name != "lookup") {
+        throw std::runtime_error("shared rewrite fixture did not request lookup");
+    }
+    ninfer::ChatMessage assistant;
+    assistant.role = ninfer::ChatRole::Assistant;
+    assistant.reasoning_content = first.reasoning;
+    assistant.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = first.content, .media = {}});
+    assistant.tool_calls.push_back(ninfer::ToolCall{
+        .id = "lookup-alpha", .name = first.tool_calls[0].name,
+        .arguments_json = first.tool_calls[0].arguments_json});
+    input.messages.push_back(std::move(assistant));
+    ninfer::ChatMessage tool;
+    tool.role = ninfer::ChatRole::Tool;
+    tool.tool_call_id = "lookup-alpha";
+    tool.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "{\"value\":173}", .media = {}});
+    input.messages.push_back(std::move(tool));
+    const auto before = engine.runtime_stats();
+    if (before.host_state_occupied_slots != 1) {
+        throw std::runtime_error("endpoint fixture did not retain exactly one host checkpoint");
+    }
+    // Reserving the complete smaller pool requires reclaiming the shared owner's
+    // partial KV tail, even though its state image stays alive through the private alias.
+    request.execution.requested_output_tokens = evict_shared ? 960 - engine.count_tokens(input) : 96;
+    const auto result = engine.generate(engine.prepare(input), request);
+    if (result.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        result.reused_prompt_tokens == 0 || !result.tool_calls.empty() ||
+        result.content.find("173") == std::string::npos) {
+        throw std::runtime_error("shared rewrite broke a real tool-result endpoint continuation");
+    }
+    const auto after = engine.runtime_stats();
+    if (after.state_moves <= before.state_moves) {
+        throw std::runtime_error("endpoint fixture did not consume its private source");
+    }
+    if (!engine.discard_session("endpoint-shared-rewrite")) {
+        throw std::runtime_error("endpoint fixture could not release its private lineage");
+    }
+    const auto released = engine.runtime_stats();
+    if (evict_shared) {
+        // There is only one shared catalog slot. Its eviction transfers the retained
+        // host rewrite allocation to the consumed source; later capture can publish again.
+        if (after.pressure_shared_owners_evicted != before.pressure_shared_owners_evicted + 1) {
+            throw std::runtime_error("endpoint pressure did not reclaim its shared alias");
+        }
+    } else if (released.host_state_occupied_slots == 0) {
+        throw std::runtime_error("endpoint continuation did not preserve its shared host replica");
+    }
+    return 0;
+}
+
 int exercise_immutable_base_promotion(const char* artifact) {
     ninfer::EngineOptions configured = engine_options(artifact);
     configured.enable_vision                                  = false;
@@ -2204,6 +2304,17 @@ int main() {
                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS nor a Qwen3.8 equivalent is set\n";
         return 77;
     }
+    if (scenario != nullptr && (std::string_view(scenario) == "endpoint-shared-rewrite" ||
+                               std::string_view(scenario) == "endpoint-shared-pressure")) {
+        const char* artifact = qwen38_groupwise;
+        if (artifact == nullptr || *artifact == '\0') { artifact = qwen38_nvfp4; }
+        if (artifact == nullptr || *artifact == '\0') { artifact = groupwise; }
+        if (artifact == nullptr || *artifact == '\0') { artifact = nvfp4; }
+        const int result = exercise_endpoint_shared_rewrite(artifact,
+            std::string_view(scenario) == "endpoint-shared-pressure");
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
     if (scenario != nullptr && std::string_view(scenario) == "immutable-base-promotion") {
         const char* artifact = qwen38_groupwise;
         if (artifact == nullptr || *artifact == '\0') { artifact = qwen38_nvfp4; }
@@ -2352,6 +2463,15 @@ int main() {
         }
         if (const int result = exercise_concurrent_resource_settlement(qwen38_nvfp4, "qwen3_8_27b");
             result != 0) {
+            return result;
+        }
+    }
+    for (const char* artifact : {groupwise, nvfp4, qwen38_groupwise, qwen38_nvfp4}) {
+        if (artifact == nullptr || *artifact == '\0') { continue; }
+        if (const int result = exercise_endpoint_shared_rewrite(artifact); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_endpoint_shared_rewrite(artifact, true); result != 0) {
             return result;
         }
     }

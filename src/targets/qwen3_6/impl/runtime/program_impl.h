@@ -1313,7 +1313,8 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
                 state_store->checkpoint_references(*protection.state) !=
                 protection.consumed_state_references;
 
-            if (is_rewrite_checkpoint_restore(admission.reuse)) {
+            if (admission.reuse == ReusePath::PrivateEndpoint ||
+                is_rewrite_checkpoint_restore(admission.reuse)) {
                 const auto append_optional_state = [&](StateImageHandle state) {
                     if (!state_store->valid(state) || state_exclusive_to_sequence(source, state) ||
                         std::any_of(
@@ -1332,7 +1333,8 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
                     append_optional_state(*source.rewrite_state);
                 }
                 for (const LongAnchorCheckpoint& anchor : source.long_anchors) {
-                    if (anchor.frontier <= admission.reuse_base) {
+                    if (admission.reuse == ReusePath::PrivateEndpoint ||
+                        anchor.frontier <= admission.reuse_base) {
                         append_optional_state(anchor.state);
                     }
                 }
