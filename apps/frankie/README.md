@@ -184,14 +184,58 @@ Thinking-enabled HTTP tests also executed a real lookup and calculation, then
 answered correctly at short and approximately 101k context. All four call IDs
 were distinct, and the long tool continuations reused over 101k prompt tokens.
 The 130,725-token repeated prose request reused 130,718 tokens and reached first
-content in 156 ms. A separate 100,925-token exact replay missed the cache; these
-measurements do not establish that every repeated request retains its prefix.
+content in 156 ms. That initial mixed NVFP4 run also exposed an exact-replay cache
+miss. The retention correction has since been qualified with the separate groupwise
+pressure test below; the complete mixed NVFP4 measurement matrix has not been repeated.
 
 The mixed NVFP4 configuration occupied approximately 29.8 GiB of total reported
 GPU memory. This includes the loaded speech components and the allocated KV
 pool. The mixed recipe is larger than groupwise weights and is not a 24 GiB
 configuration. These focused checks do not replace broader model-quality,
 long-duration conversation or workload-specific capacity evaluation.
+
+### Repeated conversations under cache pressure
+
+A subsequent RTX 5090 comparison used groupwise weights, all speech/vision on GPU,
+MTP 3, NVFP4 KV, a 400,000-token pool, four lanes, three spare GPU state images and
+eight host state images. Each build started fresh; distinct long prompts filled
+both state-image pools before a new conversation began. The correction coalesces
+matching message/rewrite boundaries and lets rolling checkpoints displace eligible
+inactive state within the existing limits. It also skips optional shared promotion
+when its immutable source fork has not yet received a model write. Endpoint reuse
+also accounts for shared optional checkpoints according to their physical ownership,
+including ownership transferred by pressure eviction.
+
+| Same-configuration workload | Before correction | Corrected build |
+| --- | ---: | ---: |
+| Next two turns in a new 32k conversation, cached tokens | 0 / 0 | 31,985 / 32,129 |
+| Those turns, client time to first content | 18.86 / 18.30 s | 1.83 / 1.82 s |
+| Second identical 99,039-token request, cached tokens | 0 | 99,032 |
+| That replay, client time to first content | 79.45 s | 2.47 s |
+
+The retention/fork-corrected run completed 28 sequential requests, including real lookup/calculation
+chains at 32k and 99k context, followed by four additional identical long replays.
+All ten warm long replays recomputed only seven tokens and returned identical output.
+Native decode stayed around 121–124 tok/s for 512-token replies. Client-visible
+rates varied with delivery timing: the main warm set had a 118 tok/s median and one
+80 tok/s stall; the four follow-ups measured 117–137 tok/s. These results establish
+avoided repeated prefill, not a decode-kernel speedup or a uniform latency guarantee.
+
+Those sequential timings preceded the final endpoint-ownership correction. Its real CUDA
+regression fails on the prior engine and passes with shared host state both retained and
+reclaimed under pressure. The final build also passes all 15 realtime harness checks,
+including simultaneous HTTP tool-result continuations, spoken tools and interruption recovery.
+A separate eight-request spot check on that final build preserved all four warm 99,039-token
+replays at 99,032 cached tokens and seven new tokens, with identical 512-token output and
+120–125 client tok/s (120–122 native). Its real thinking-enabled tool chain advanced through
+99,131 and 99,279 cached tokens; returning to the earlier exact prompt also retained its cache.
+
+Thinking settings must stay consistent when comparing cache hits: enabling the
+model's default high-effort reasoning adds system instructions and changes the
+prefix. Inactive histories can still be displaced under pressure, and capture may
+skip when no legal repair fits; bounded cache does not retain every conversation.
+Cold prefill admission and shared voice/HTTP capacity retain the limits described
+above.
 
 Before calling a CUDA build validated, exercise text and images, speech input
 and output, a real tool/result round trip in both protocols, interruption and

@@ -445,6 +445,12 @@ exclusive optional resources。Fork 期间借用的 immutable StateImage/KV sour
 optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一 allocation 会被重复收费，并把合法的
 Fork 错判为超出 active guarantee。
 
+Endpoint consumption follows the same rule for retained rewrite and anchor images: only
+source-exclusive replicas contribute optional active entitlement. If the pressure plan removes the
+last external alias, the allocation becomes exclusive to the consumed source and must be included
+in that plan's ownership transfer. Counting the shared replica before transfer, or omitting it
+after transfer, violates materialization's exact resource equality.
+
 ### 6.2 Terminal 与 capture
 
 TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，直到 Program 完成：
@@ -461,7 +467,8 @@ StateImage Fork. The immutable private source remains reusable; its destination 
 after the first actual model write. Skipping promotion must neither settle an unwritten destination
 nor fail the active request.
 
-A private TurnClosure rewrite checkpoint has a separate fallback when its state image cannot fit:
+A private rewrite checkpoint (TurnClosure or ResponseReplay) has a separate fallback when its state
+image cannot fit:
 the same bounded capture planner may reclaim inactive cached state at the least complete-post-state
 cost. This protects continuation reuse for newly admitted conversations after image-pool saturation.
 It neither expands configured pools nor reclaims active/borrowed/pinned state. Other optional private
