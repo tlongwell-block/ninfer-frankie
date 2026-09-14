@@ -63,6 +63,11 @@ weight quantization. `--max-context` limits each request; `--kv-capacity` is the
 shared pool, capped by `max-context × max-concurrency`. Concurrent requests need
 enough room for their combined prompt and output reservations. Increase the pool
 after measuring speech and graph memory.
+Qualify larger pools with simultaneous requests and long audio/image inputs;
+successful startup alone does not establish that speech graphs still fit.
+`--device-state-slots 0` removes spare GPU cache checkpoints while keeping the
+active lane states. Cached checkpoints can use the host budget instead, trading
+GPU memory for transfer overhead; it does not move model computation to CPU.
 The combined server uses CUDA device 0; it rejects other `--device` indices
 to keep the brain and speech on the same GPU.
 Automatic KV allocation is disabled for this executable because it would consume
@@ -87,8 +92,14 @@ token protects HTTP and WebSocket routes. `--cors` enables browser HTTP access.
 Only one client owns the realtime conversation at a time. Realtime and HTTP
 share the configured active-request capacity. A voice request can queue if HTTP
 already occupies every lane; there is no reserved voice lane or request
-preemption. Choose enough lanes and KV capacity for the intended simultaneous
-workload.
+preemption. NInfer also admits only one cold prefill at a time: a long HTTP
+prefill delays a new voice brain request even when other lanes are free. Decode
+that is already active can progress between prefill chunks. Choose enough lanes
+and KV capacity for the intended simultaneous workload, and use
+`--pending-timeout-ms 600000` with suitably long client timeouts when requests
+may queue behind large cold prompts. The default queue deadline is 30 seconds;
+raising it prevents premature queue errors but does not remove this scheduling
+delay.
 
 ## Connect clients
 
