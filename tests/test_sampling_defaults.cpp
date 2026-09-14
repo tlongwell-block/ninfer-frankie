@@ -84,10 +84,9 @@ int main() {
                                                "groupwise-int"}) ==
                           Dense27::WeightsProfile::Qwen38GroupwiseInt,
                       "Frankie did not reuse the Qwen3.8 groupwise physical layout");
-    failures += check(throws_runtime([] {
-                          (void)Dense27::resolve_weights({std::string(Dense27::frankie_model_id),
-                                                         "nvfp4"});
-                      }), "unregistered Frankie NVFP4 identity was accepted");
+    failures += check(Dense27::resolve_weights({std::string(Dense27::frankie_model_id),
+                                               "nvfp4"}) == Dense27::WeightsProfile::Qwen38Nvfp4,
+                      "Frankie did not reuse the Qwen3.8 NVFP4 physical layout");
     failures += check(same_preset(qwen3_6_35.thinking, moe_thinking) &&
                           same_preset(qwen3_6_35.non_thinking, dense_non_thinking),
                       "Qwen3.6-35B-A3B defaults mismatch");
