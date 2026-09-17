@@ -239,13 +239,16 @@ public:
         }
         key.size = static_cast<std::uint16_t>(session_key.size());
         std::copy(session_key.begin(), session_key.end(), key.bytes.begin());
-        std::scoped_lock lock(execution_mutex_);
-        device_.bind_to_current_thread();
-        const bool discarded = resources_.discard_session(*instance_.program, key);
-        if (discarded) {
-            request_admission_check();
-            queue_cv_.notify_one();
-        }
+        // Session open/close must get the same bounded execution opportunity as
+        // speech work, even when HTTP requests keep the worker continuously busy.
+        bool discarded = false;
+        with_device_idle([&] {
+            discarded = resources_.discard_session(*instance_.program, key);
+            if (discarded) {
+                request_admission_check();
+                queue_cv_.notify_one();
+            }
+        });
         return discarded;
     }
 

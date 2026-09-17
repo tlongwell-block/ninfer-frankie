@@ -3,8 +3,10 @@
 #include "ninfer/engine.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -36,6 +38,20 @@ struct Sink final : ninfer::OutputSink {
         for (std::size_t n = 0; n < event.token_ids.size(); ++n) {
             require(features_by_position.emplace(event.begin + n, event.token_ids[n]).second,
                     "duplicate executed target row");
+        }
+    }
+};
+
+struct StartedSink final : ninfer::OutputSink {
+    std::promise<void> first_output;
+    bool started = false;
+    void start(ninfer::GenerationStart) override {}
+    void progress(ninfer::PromptProgress) override {}
+    void timing(ninfer::GenerationTimingObservation) override {}
+    void publish(ninfer::OutputDelta) override {
+        if (!started) {
+            started = true;
+            first_output.set_value();
         }
     }
 };
@@ -124,7 +140,32 @@ void run(const char* artifact, unsigned drafts) {
         require(sink.features_by_position.contains(position), "generated token lost its executed feature");
         require(sink.features_by_position.at(position) == token, "generated feature alignment mismatch");
     }
-    require(engine.discard_session("embedded-runtime-test"), "terminal voice session not releasable");
+    // A voice session can open/close while an unrelated HTTP request continues
+    // decoding. Drain that request concurrently so backpressure cannot make this
+    // pass merely by leaving the GPU worker idle.
+    auto busy_request = request;
+    busy_request.execution.requested_output_tokens = 384;
+    auto busy = engine.submit(engine.prepare_tokens(engine.tokenize_text(
+        "<|im_start|>user\nCount from one to two hundred, one number per line, "
+        "without skipping any.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        false), busy_request, ninfer::OutputConsumerMode::Streaming);
+    StartedSink started;
+    auto first_output = started.first_output.get_future();
+    auto draining = std::async(std::launch::async, [&] { return busy.wait(&started); });
+    require(first_output.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+            "background HTTP request did not start");
+    const auto cleanup_start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < 8; ++i) {
+        require(engine.discard_session("embedded-runtime-test"),
+                "idle voice session not releasable during HTTP decode");
+    }
+    const auto cleanup_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - cleanup_start).count();
+    require(cleanup_ms < 1000, "voice session cleanup starved behind HTTP decode");
+    require(draining.wait_for(std::chrono::seconds(0)) == std::future_status::timeout,
+            "voice session cleanup waited for HTTP completion");
+    require(!draining.get().generated_token_ids.empty(), "background HTTP request failed");
+    std::cout << "voice cleanup during HTTP decode: " << cleanup_ms << " ms\n";
     std::cout << "embedded runtime MTP " << drafts << ": passed\n";
 }
 } // namespace
