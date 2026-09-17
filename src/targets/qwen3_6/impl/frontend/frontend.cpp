@@ -4,6 +4,9 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
+#include <bit>
+#include <cmath>
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
@@ -1570,6 +1573,96 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     result.context_cache.update_session_index = false;
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
+}
+
+PreparedPromptData& PreparedPromptAccess::mutable_view(PreparedPrompt& prompt) {
+    if (!prompt.data_) { throw std::invalid_argument("prepared prompt is empty"); }
+    return *prompt.data_;
+}
+
+void Frontend::validate_media_budget(const PromptPreparationStats& stats) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    if (stats.media_items != 0 && !impl_->vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
+    try {
+        fi::enforce_media_resource_limits(fi::PreprocessStats{
+            .media_items = stats.media_items,
+            .media_bytes = stats.media_bytes,
+            .raw_patches = stats.raw_patches,
+            .vision_tokens = stats.vision_tokens,
+        }, impl_->processor);
+    } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+}
+
+PreparedPrompt Frontend::prepare_embeddings(std::vector<TokenId> token_ids,
+                                            std::vector<InputEmbeddingSpan> embeddings,
+                                            RawPromptOptions options) const {
+    auto prepared = prepare_tokens(std::move(token_ids), options.allow_prefix_identity);
+    auto& result = *prepared.data_;
+    result.starts_in_reasoning = options.enable_thinking;
+    if (options.session_key) {
+        if (options.session_key->empty() || options.session_key->size() > kPreparedSessionKeyCapacity) {
+            throw std::invalid_argument("raw prompt session_key must contain 1 to 256 bytes");
+        }
+        auto& key = result.context_cache.session_key.emplace();
+        key.size = static_cast<std::uint16_t>(options.session_key->size());
+        std::copy(options.session_key->begin(), options.session_key->end(), key.bytes.begin());
+        result.context_cache.retention = runtime::RetentionClass::LiveSession;
+        result.context_cache.update_session_index = true;
+    }
+    std::uint32_t previous_frontier = 0;
+    for (auto frontier : options.rewrite_execution_frontiers) {
+        if (frontier == 0 || frontier > result.token_ids.size() || frontier <= previous_frontier) {
+            throw std::invalid_argument("raw prompt execution frontiers must be ordered within the prompt");
+        }
+        previous_frontier = frontier;
+    }
+    result.identity.rewrite_execution_frontiers = std::move(options.rewrite_execution_frontiers);
+    if (options.rewrite_checkpoint) {
+        const auto frontier = *options.rewrite_checkpoint;
+        if (frontier == 0 || frontier > result.token_ids.size()) {
+            throw std::invalid_argument("raw prompt checkpoint must lie within the prompt");
+        }
+        result.identity.rewrite_checkpoint = RewriteCheckpointSpec{
+            RewriteCheckpointKind::ResponseReplay, frontier};
+        auto& boundaries = result.identity.rewrite_execution_frontiers;
+        const auto at = std::lower_bound(boundaries.begin(), boundaries.end(), frontier);
+        if (at == boundaries.end() || *at != frontier) { boundaries.insert(at, frontier); }
+    }
+    std::uint64_t previous_end = 0;
+    for (auto& input : embeddings) {
+        if (input.width == 0 || input.values.empty() || input.values.size() % input.width != 0) {
+            throw std::invalid_argument("input embeddings must contain complete nonempty rows");
+        }
+        const auto rows = input.values.size() / input.width;
+        if (input.begin < previous_end || input.begin > result.token_ids.size() ||
+            rows > result.token_ids.size() - input.begin) {
+            throw std::invalid_argument("input embedding spans must be ordered, disjoint and inside the prompt");
+        }
+        previous_end = input.begin + rows;
+        PreparedEmbeddingSpan span{input.begin, input.width, {}};
+        span.values.reserve(input.values.size());
+        for (const float value : input.values) {
+            if (!std::isfinite(value)) {
+                throw std::invalid_argument("input embeddings must be finite");
+            }
+            const auto bits = std::bit_cast<std::uint32_t>(value);
+            const auto bf16 = static_cast<std::uint16_t>((bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16);
+            if ((bf16 & 0x7f80U) == 0x7f80U) {
+                throw std::invalid_argument("input embedding exceeds BF16 finite range");
+            }
+            span.values.push_back(bf16);
+        }
+        for (std::size_t row = 0; row < rows; ++row) {
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(span.values.data() + row * input.width);
+            result.embedding_identity.push_back(EmbeddingRowIdentity{
+                static_cast<std::uint32_t>(input.begin + row), input.width,
+                frontend_internal::sha256(std::span<const std::uint8_t>(bytes, input.width * sizeof(std::uint16_t)))});
+        }
+        result.embeddings.push_back(std::move(span));
+    }
+    return prepared;
 }
 
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {

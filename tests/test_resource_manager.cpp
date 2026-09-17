@@ -478,6 +478,7 @@ struct FakeCaptureAssessment {
     std::vector<CheckpointRecoveryAlternativeWork> projected_recovery_work{fake_recovery_work(0)};
     std::vector<CheckpointRef> private_replacement_candidates;
     bool publishes_private   = false;
+    bool rewrite_checkpoint  = false;
     bool publishes_shared    = false;
     bool needs_transfer      = false;
     bool physically_feasible = true;
@@ -988,11 +989,14 @@ public:
     }
 
     [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
-                                                        const FakeSharedPrefixHandle*,
+                                                        const FakeSharedPrefixHandle* exact_shared,
                                                         const FakeSharedPrefixHandle*,
                                                         std::optional<CheckpointRef>,
                                                         bool permit_shared_publication) const {
         FakeCaptureAssessment assessment = capture_assessment;
+        if (exact_shared != nullptr && capture_exact_shared_reuses_state) {
+            assessment.physically_feasible = true;
+        }
         if (!permit_shared_publication) { assessment.publishes_shared = false; }
         return assessment;
     }
@@ -1044,7 +1048,7 @@ public:
 
     [[nodiscard]] bool shared_capture_matches(const FakeCaptureOffer&,
                                               const FakeSharedPrefixHandle&) const {
-        return false;
+        return capture_matches_shared;
     }
 
     void skip_capture(FakeCaptureOffer&&) { ++skipped_captures; }
@@ -1153,6 +1157,8 @@ public:
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
     bool abort_capture_start                             = false;
+    bool capture_matches_shared                          = false;
+    bool capture_exact_shared_reuses_state                = false;
     bool report_shared_source_summary                    = false;
     bool change_shared_source_residency_on_second_report = false;
     std::uint32_t reported_shared_active_references      = 0;
@@ -2582,6 +2588,50 @@ void test_retained_source_is_protected_until_terminal() {
             "released source did not participate in the sealed pressure plan");
 }
 
+void test_discard_session_releases_demoted_history_only() {
+    FakeManager manager = make_manager(2, 6);
+    FakeProgram program;
+    const FakeCacheSessionKey session{42};
+    const auto base = make_base(42, session, RetentionClass::LiveSession, true);
+    const auto older = start_active(manager, program, 42, base, 10);
+    const auto newer = start_active(manager, program, 42, base, 20);
+    (void)finish_active(manager, program, newer, 16);
+    (void)finish_active(manager, program, older, 16);
+    const auto other = start_active(manager, program, 99,
+        make_base(99, FakeCacheSessionKey{99}, RetentionClass::LiveSession), 30);
+    (void)finish_active(manager, program, other, 16);
+    require(manager.discard_session(program, FakeCacheSessionKey{404}) && program.released_continuations.empty(),
+            "unknown session discard altered cached requests");
+    require(manager.discard_session(program, session), "settled session discard did not complete");
+    require(program.released_continuations.size() == 2,
+            "session discard missed an anonymous older endpoint or released another session");
+    const auto cold = manager.inspect(program, FakePreparedPrompt{42}, base, 40);
+    require(cold.choice && cold.choice->summary().reusable_prompt_tokens == 0,
+            "discarded history remained reusable");
+    const auto hot = manager.inspect(program, FakePreparedPrompt{99}, make_base(99, FakeCacheSessionKey{99}), 50);
+    require(hot.choice && hot.choice->summary().reusable_prompt_tokens == 16,
+            "discarding one session invalidated another session's prefix");
+    require(manager.discard_session(program, session) && program.released_continuations.size() == 2,
+            "repeated discard released a continuation twice");
+}
+
+void test_discard_session_waits_for_borrowed_source() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey source_session{1}, borrower_session{2};
+    const auto seed = start_active(manager, program, 9,
+        make_base(9, source_session, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, seed);
+    const auto fork = start_active(manager, program, 9,
+        make_base(9, borrower_session, RetentionClass::LiveSession), 2);
+    require(!manager.discard_session(program, source_session) &&
+            !manager.discard_session(program, borrower_session) && program.released_continuations.empty(),
+            "session discard released active state or a borrowed prefix");
+    (void)manager.abort(program, fork.lane, fork.sequence);
+    require(manager.discard_session(program, source_session) && program.released_continuations.size() == 1,
+            "settled borrowed prefix could not be released");
+}
+
 void test_session_publication_order_controls_tied_source() {
     FakeManager manager = make_manager(2, 3);
     FakeProgram program;
@@ -2870,6 +2920,138 @@ void test_in_progress_adoption_and_private_capture() {
     require(manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Active,
             "private capture disturbed active lane ownership");
     (void)finish_active(manager, program, active, 24);
+}
+
+void test_rolling_rewrite_capture_repairs_saturated_inactive_state() {
+    for (const bool abort_first : {false, true}) {
+        FakeManager manager = make_manager(1, 4);
+        FakeProgram program;
+        const ActiveRequest stale = start_active(manager, program, 401, make_base(401), 1);
+        (void)finish_active(manager, program, stale);
+        const ActiveRequest active = start_active(manager, program, 402, make_base(402), 2);
+        // No image is free, but one retained inactive owner can safely supply capacity. There
+        // is no shared marker or requested cache hint: ordinary turn closure still needs it.
+        program.required_pressure_actions    = 1;
+        program.pressure_action_immediate_ns = 0;
+        program.capture_assessment           = FakeCaptureAssessment{
+                      .shortlist_key          = FakeShortlistKey{.digest = 402, .frontier = 24},
+                      .protected_rebuild_work = PrefillWork{.tokens = 24},
+                      .publishes_private      = true,
+                      .rewrite_checkpoint     = true,
+                      .physically_feasible    = false,
+        };
+        program.capture_summary.endpoint = endpoint(402, 24);
+        program.capture_summary.rewrite  = rewrite_checkpoint(402, 24);
+        if (abort_first) {
+            program.abort_capture_start = true;
+            require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 41},
+                                                   0, {}) ==
+                            FakeManager::ActiveCaptureReserveResult::Skipped &&
+                        !manager.context_transaction_kind() && !program.has_context_transaction() &&
+                        manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+                    "aborted rewrite repair leaked its inactive victim or transaction");
+            program.abort_capture_start = false;
+        }
+        require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 42}, 0,
+                                               {}) ==
+                    FakeManager::ActiveCaptureReserveResult::Reserved,
+                "rolling rewrite became uncachable when inactive state filled the image pool");
+        auto progress      = manager.progress_context_transaction(program, {});
+        const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+        require(
+            outcome.status == ContextTransactionStatus::Published &&
+                program.started_action_ids.size() == 1 &&
+                manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Active,
+            "rewrite repair did not publish with one legal victim and preserve its active lane");
+        RuntimeStats stats;
+        manager.populate_runtime_stats(program, stats);
+        require(stats.shared_active_references == 0,
+                "private rewrite repair unexpectedly published a shared owner");
+        program.required_pressure_actions = 0;
+        (void)finish_active(manager, program, active, 24);
+    }
+}
+
+void test_rolling_rewrite_capture_preserves_active_borrower() {
+    FakeManager manager = make_manager(2, 5);
+    FakeProgram program;
+    const auto source =
+        start_active(manager, program, 501,
+                     make_base(501, FakeCacheSessionKey{1}, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, source);
+    const auto borrower =
+        start_active(manager, program, 501,
+                     make_base(501, FakeCacheSessionKey{2}, RetentionClass::LiveSession), 2);
+    const auto active                 = start_active(manager, program, 502, make_base(502), 3);
+    program.required_pressure_actions = 1;
+    program.capture_assessment        = FakeCaptureAssessment{
+               .shortlist_key          = FakeShortlistKey{.digest = 502, .frontier = 24},
+               .protected_rebuild_work = PrefillWork{.tokens = 24},
+               .publishes_private      = true,
+               .rewrite_checkpoint     = true,
+               .physically_feasible    = false,
+    };
+    require(
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 43}, 0, {}) ==
+                FakeManager::ActiveCaptureReserveResult::Skipped &&
+            program.started_action_ids.empty() && !manager.context_transaction_kind() &&
+            manager.lane_state(borrower.lane) == ninfer::runtime::LogicalLaneState::Active &&
+            manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Active,
+        "rewrite repair reclaimed a borrowed checkpoint or disturbed an active request");
+    program.required_pressure_actions = 0;
+    (void)manager.abort(program, active.lane, active.sequence);
+    (void)manager.abort(program, borrower.lane, borrower.sequence);
+}
+
+void test_rolling_rewrite_with_exact_shared_checkpoint() {
+    for (const bool can_adopt_exact_state : {false, true}) {
+        FakeManager manager = make_manager(1, 4, 1);
+        FakeProgram program;
+        auto shared_base = make_base(601);
+        shared_base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = 64,
+        });
+        const auto source          = start_active(manager, program, 601, shared_base, 1);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = 601, .frontier = 64},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_shared       = true,
+            .physically_feasible    = true,
+        };
+        require(manager.reserve_active_capture(program, source.lane, FakeCaptureOffer{.id = 51}, 0,
+                                               {}) ==
+                    FakeManager::ActiveCaptureReserveResult::Reserved,
+                "exact shared fixture could not publish its source");
+        (void)manager.progress_context_transaction(program, {});
+        (void)finish_active(manager, program, source);
+        const auto stale = start_active(manager, program, 602, make_base(602), 2);
+        (void)finish_active(manager, program, stale);
+        const auto active                    = start_active(manager, program, 601, shared_base, 3);
+        program.required_pressure_actions    = 1;
+        program.pressure_action_immediate_ns = 0;
+        program.capture_assessment.publishes_private   = true;
+        program.capture_assessment.rewrite_checkpoint  = true;
+        program.capture_assessment.physically_feasible = false;
+        program.capture_matches_shared                 = true;
+        program.capture_exact_shared_reuses_state      = can_adopt_exact_state;
+        program.started_action_ids.clear();
+        program.capture_summary.endpoint = endpoint(601, 64);
+        program.capture_summary.rewrite  = rewrite_checkpoint(601, 64);
+        require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 52}, 0,
+                                               {}) ==
+                    FakeManager::ActiveCaptureReserveResult::Reserved,
+                "exact shared prefix prevented rolling rewrite capture under state pressure");
+        const auto progress = manager.progress_context_transaction(program, {});
+        require(std::get<FakeManager::ActiveCaptureOutcome>(progress).status ==
+                        ContextTransactionStatus::Published &&
+                    program.started_action_ids.size() == (can_adopt_exact_state ? 0U : 1U),
+                "exact-state reuse was ignored or an infeasible private capture was not repaired");
+        program.required_pressure_actions = 0;
+        (void)finish_active(manager, program, active, 64);
+    }
 }
 
 void test_projected_nested_shared_candidates_use_marginal_value() {
@@ -3486,6 +3668,8 @@ int main() {
              test_aborted_source_selection_does_not_create_hit_history);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
     run_test("session publication order", test_session_publication_order_controls_tied_source);
+    run_test("discard session history", test_discard_session_releases_demoted_history_only);
+    run_test("discard borrowed session", test_discard_session_waits_for_borrowed_source);
     run_test("canonical pressure", test_canonical_pressure_starts_with_disposable_owner);
     run_test("all preserving pressure alternatives",
              test_pressure_tries_every_preserving_alternative_before_eviction);
@@ -3503,6 +3687,12 @@ int main() {
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);
+    run_test("rolling rewrite under state pressure",
+             test_rolling_rewrite_capture_repairs_saturated_inactive_state);
+    run_test("rolling rewrite preserves borrowed state",
+             test_rolling_rewrite_capture_preserves_active_borrower);
+    run_test("rolling rewrite with exact shared prefix",
+             test_rolling_rewrite_with_exact_shared_checkpoint);
     run_test("projected shared marginal value",
              test_projected_nested_shared_candidates_use_marginal_value);
     run_test("observed shared independent domains",

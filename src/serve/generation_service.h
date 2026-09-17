@@ -132,6 +132,9 @@ public:
 
     void warmup();
 
+    // Realtime and HTTP share this service-owned Engine.
+    [[nodiscard]] ninfer::Engine& engine() noexcept { return *engine_; }
+
 private:
     enum class CacheParticipation : std::uint8_t {
         Disabled,

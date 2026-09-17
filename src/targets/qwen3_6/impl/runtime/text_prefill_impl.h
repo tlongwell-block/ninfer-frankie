@@ -52,7 +52,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
-                                      bool finalize_at_end) {
+                                      bool finalize_at_end, const PreparedPromptData* embedded_prompt) {
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
@@ -62,6 +62,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_input_embeddings(embedded_prompt);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -85,12 +86,27 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_input_embeddings(&prompt);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
                                   finalize_at_end, sink);
     }
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
+}
+
+Tensor external_embedding_at(PrefillContext& state, const PreparedPromptData& prompt,
+                             std::uint32_t position) {
+    for (const auto& span : prompt.embeddings) {
+        if (position < span.begin || position - span.begin >= span.values.size() / span.width) { continue; }
+        // Persistent prefill staging survives mtp_bridge_and_propose's workspace reset.
+        Tensor row = state.execution.prefill_hidden.slice(1, 0, 1);
+        const auto* source = span.values.data() + static_cast<std::size_t>(position - span.begin) * span.width;
+        CUDA_CHECK(cudaMemcpyAsync(row.data, source, row.bytes(), cudaMemcpyHostToDevice,
+                                   state.execution.device.stream));
+        return row;
+    }
+    return {};
 }
 
 void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
@@ -126,6 +142,10 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
         composed_embedding = &visual_embedding;
     }
 
+    if (auto external = external_embedding_at(state, prompt, state.text_kv_base); external.data) {
+        visual_embedding = external;
+        composed_embedding = &visual_embedding;
+    }
     mtp_bridge_and_propose(state, bridge_token, *bridge.previous_hidden, bridge.position,
                            bridge.rope_position, false, composed_embedding);
 }

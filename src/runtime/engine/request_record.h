@@ -109,7 +109,7 @@ struct RequestRecord {
     using OutputSession  = typename Package::OutputSession;
     using BasePlan       = typename Package::RequestBasePlan;
     using SequenceHandle = typename Package::SequenceHandle;
-    using StreamEvent    = std::variant<GenerationTimingObservation, OutputDelta>;
+    using StreamEvent    = std::variant<GenerationTimingObservation, OutputDelta, CommittedTokens, CommittedTokenFeatures>;
 
     RequestRecord(std::uint64_t request_identity, std::uint64_t publication_sequence,
                   PreparedPrompt input, OutputSession output_session, PromptSummary summary,
@@ -139,7 +139,9 @@ struct RequestRecord {
     }
 
     [[nodiscard]] bool is_decode_ready() const noexcept {
-        return model_state == EngineRequestState::DecodeReady;
+        return model_state == EngineRequestState::DecodeReady &&
+            (observation.max_queued_tokens == 0 ||
+             unconsumed_tokens.load(std::memory_order_acquire) < observation.max_queued_tokens);
     }
 
     [[nodiscard]] bool is_control_ready() const noexcept {
@@ -171,11 +173,13 @@ struct RequestRecord {
     std::optional<BeginSummary> admitted_begin;
     std::optional<BeginSummary> begin;
     std::vector<TokenId> generated;
+    std::vector<std::uint32_t> execution_frontiers;
     std::string content;
     std::string reasoning;
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
+    std::atomic<std::uint32_t> unconsumed_tokens{0};
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;

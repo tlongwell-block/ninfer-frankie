@@ -219,6 +219,17 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .backend        = plan.speculative_backend});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
+    if (plan.hidden_layer) {
+        if (*plan.hidden_layer >= TextConfig::layers ||
+            (plan.speculative_backend != SpeculativeBackend::None &&
+             plan.speculative_backend != SpeculativeBackend::Mtp)) {
+            throw std::invalid_argument("hidden feature capture supports target layers with ordinary or MTP decode");
+        }
+        const auto columns = std::max(effective_prefill_chunk,
+            static_cast<std::int32_t>(plan.max_concurrency * (plan.draft_window + 1)));
+        out.feature_hidden = add_tensor(builder, DType::BF16, {TextConfig::hidden, columns},
+                                        "target layer feature staging");
+    }
     if (plan.causal_scoring) {
         out.score_hidden = add_tensor(
             builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(kCausalScoreTile)},
@@ -726,6 +737,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
+    impl->hidden_layer = inputs.hidden_layer;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
@@ -797,6 +809,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
+        .hidden_layer        = options.hidden_layer,
         .device              = options.device,
         .context_cache       = options.context_cache,
     };

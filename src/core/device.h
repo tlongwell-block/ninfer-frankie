@@ -39,6 +39,8 @@ struct DeviceContext {
     DeviceExecutionView execution_view() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;
+    // Complete this process's streams on the selected device at an external-runtime boundary.
+    void synchronize_device() const;
 };
 
 class CudaEventTimer {

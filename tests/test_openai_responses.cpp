@@ -286,14 +286,17 @@ int test_typed_items_and_cache_markers() {
             media.bytes = {1};
             return media;
         });
-    failures += check(translated.context_cache.markers.size() == 2 &&
+    failures += check(translated.context_cache.markers.size() == 3 &&
                           translated.context_cache.markers[0].kind ==
                               ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
                           translated.context_cache.markers[0].location ==
                               ninfer::PromptCacheMarkerLocation::MessagePartBoundary &&
                           translated.context_cache.markers[1].kind ==
-                              ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-                      "Responses breakpoints become shared Engine part boundaries");
+                              ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                          translated.context_cache.markers[2].location ==
+                              ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                          translated.context_cache.markers[2].after_message_count == 4,
+                      "Responses preserves explicit part boundaries and the implicit full message");
     return failures;
 }
 

@@ -232,6 +232,43 @@ public:
         return Submission(*this, std::move(request));
     }
 
+    bool discard_session(std::string_view session_key) {
+        typename Package::CacheSessionKey key;
+        if (session_key.empty() || session_key.size() > key.bytes.size()) {
+            throw std::invalid_argument("session_key must contain 1 to 256 bytes");
+        }
+        key.size = static_cast<std::uint16_t>(session_key.size());
+        std::copy(session_key.begin(), session_key.end(), key.bytes.begin());
+        // Session open/close must get the same bounded execution opportunity as
+        // speech work, even when HTTP requests keep the worker continuously busy.
+        bool discarded = false;
+        with_device_idle([&] {
+            discarded = resources_.discard_session(*instance_.program, key);
+            if (discarded) {
+                request_admission_check();
+                queue_cv_.notify_one();
+            }
+        });
+        return discarded;
+    }
+
+    void with_device_idle(const std::function<void()>& work) {
+        if (!work) { throw std::invalid_argument("external device work is empty"); }
+        external_waiters_.fetch_add(1, std::memory_order_acq_rel);
+        std::unique_lock lock(execution_mutex_);
+        external_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+        device_.bind_to_current_thread();
+        device_.synchronize();
+        try {
+            work();
+        } catch (...) {
+            // A foreign runtime may have queued work before throwing. Keep its scratch and
+            // the brain exclusive until every stream in this process has completed.
+            device_.synchronize_device();
+            throw;
+        }
+    }
+
     [[nodiscard]] MemorySummary memory_summary() const {
         std::scoped_lock lock(execution_mutex_);
         MemorySummary out                      = instance_.program->memory_summary();
@@ -614,6 +651,15 @@ private:
                     for (auto& event : events) {
                         if (auto* timing = std::get_if<GenerationTimingObservation>(&event)) {
                             sink->timing(std::move(*timing));
+                        } else if (auto* tokens = std::get_if<CommittedTokens>(&event)) {
+                            const auto count = static_cast<std::uint32_t>(tokens->token_ids.size());
+                            sink->tokens(std::move(*tokens));
+                            if (request->observation.max_queued_tokens != 0) {
+                                request->unconsumed_tokens.fetch_sub(count, std::memory_order_acq_rel);
+                                queue_cv_.notify_one();
+                            }
+                        } else if (auto* features = std::get_if<CommittedTokenFeatures>(&event)) {
+                            sink->features(std::move(*features));
                         } else {
                             sink->publish(std::move(std::get<OutputDelta>(event)));
                         }
@@ -697,6 +743,19 @@ private:
             .prompt_elapsed_ns     = elapsed_ns(*request->admitted_at, *request->first_token),
             .generation_elapsed_ns = elapsed_ns(*request->first_token, *request->last_token),
         };
+    }
+
+    void append_tokens(const std::shared_ptr<Request>& request, std::uint32_t count) {
+        if (!request->observation.token_ids || count == 0) { return; }
+        CommittedTokens event;
+        event.begin = request->prompt_summary.prompt_tokens +
+                      static_cast<std::uint32_t>(request->generated.size()) - count;
+        event.token_ids.assign(request->generated.end() - count, request->generated.end());
+        if (request->observation.max_queued_tokens != 0) {
+            request->unconsumed_tokens.fetch_add(count, std::memory_order_acq_rel);
+        }
+        { std::lock_guard lock(request->mutex); request->events.emplace_back(std::move(event)); }
+        request->cv.notify_one();
     }
 
     void append_output(const std::shared_ptr<Request>& request, PublishedOutput output,
@@ -846,6 +905,7 @@ private:
         GenerationResult result;
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
+        result.execution_frontiers = std::move(request->execution_frontiers);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.tool_calls              = request->output.take_tool_calls();
@@ -1222,6 +1282,18 @@ private:
                     request->budget->commit(accepted);
                     if (decode_round) { Scheduling::consume_service_work(*request, accepted); }
                 }
+                if (!cancelled[row] && decisions[row].prefix_execution_split_after) {
+                    request->execution_frontiers.push_back(request->prompt_summary.prompt_tokens +
+                        static_cast<std::uint32_t>(request->generated.size()) - accepted +
+                        *decisions[row].prefix_execution_split_after);
+                }
+                if (!cancelled[row] && request->observation.hidden_features &&
+                    !committed.rows[row].features.token_ids.empty()) {
+                    { std::lock_guard lock(request->mutex);
+                      request->events.emplace_back(std::move(committed.rows[row].features)); }
+                    request->cv.notify_one();
+                }
+                if (!cancelled[row]) { append_tokens(request, accepted); }
                 auto published = request->output.commit_preview();
                 auto timing    = record_committed_output(request, accepted);
                 append_output(request, std::move(published), std::move(timing));
@@ -1901,6 +1973,11 @@ private:
             request->budget->commit(membership.row_stride);
             Scheduling::consume_service_work(*request, membership.row_stride);
             cumulative_stats_.committed_decode_tokens += membership.row_stride;
+            if (prefix_execution_splits[row]) {
+                request->execution_frontiers.push_back(request->prompt_summary.prompt_tokens +
+                    static_cast<std::uint32_t>(generated_sizes[row]) + *prefix_execution_splits[row]);
+            }
+            append_tokens(request, membership.row_stride);
             auto timing = record_committed_output(request, membership.row_stride);
             append_output(request, request->output.commit_preview(), std::move(timing));
             request->model_state = EngineRequestState::DecodeReady;
@@ -1958,6 +2035,8 @@ private:
                 }
             }
 
+            // A speech caller waiting at a completed unit boundary gets the next opportunity.
+            while (external_waiters_.load(std::memory_order_acquire) != 0) { std::this_thread::yield(); }
             std::unique_lock execution_lock(execution_mutex_);
             try {
                 set_host_work_class(HostWorkClass::Control);
@@ -2045,6 +2124,7 @@ private:
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
+    std::atomic<std::uint32_t> external_waiters_{0};
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;

@@ -341,8 +341,9 @@ resource errors.
 Chat Completions and Responses translate OpenAI cache hints into optional shared-prefix write
 candidates:
 
-- omitted `prompt_cache_options` creates a default implicit candidate at the latest representable
-  content boundary;
+- omitted `prompt_cache_options` creates a default implicit candidate after the latest nonempty
+  message, including its closing delimiters; this lets shared and rolling response checkpoints
+  use one recurrent-state image when their frontiers coincide;
 - `mode:"implicit"` requests the same automatic candidate explicitly;
 - `mode:"explicit"` disables that implicit write for the request;
 - `prompt_cache_breakpoint:{"mode":"explicit"}` on supported content creates an explicit

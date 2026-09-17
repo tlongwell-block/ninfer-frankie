@@ -7,7 +7,10 @@ single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a
 OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
 resident model, and a startup-fixed capacity of one to eight active requests.
 
-NInfer supports five artifact identities. The quick-start commands use Qwen3.8-27B NVFP4.
+This fork adds an experimental [Frankie Breeze server](apps/frankie/README.md) sharing one
+brain between HTTP and realtime voice. See that guide for its build and validation status.
+
+NInfer also supports the five stock artifact identities below. The quick-start commands use Qwen3.8-27B NVFP4.
 
 | Model | Weights | Artifact | Download and model card |
 |---|---|---|---|

@@ -4402,6 +4402,9 @@ public:
   bool send(const char *data, size_t len);
   void close(CloseStatus status = CloseStatus::Normal,
              const std::string &reason = "");
+  // Interrupt concurrent reads/writes without closing the owned descriptor.
+  // The caller must keep this WebSocket alive until the call returns.
+  void shutdown() noexcept;
   const Request &request() const;
   bool is_open() const;
 
@@ -22256,6 +22259,12 @@ inline bool WebSocket::send(const std::string &data) {
 
 inline bool WebSocket::send(const char *data, size_t len) {
   return send_frame(Opcode::Binary, data, len);
+}
+
+inline void WebSocket::shutdown() noexcept {
+  closed_ = true;
+  ping_cv_.notify_all();
+  detail::shutdown_socket(strm_.socket());
 }
 
 inline void WebSocket::close(CloseStatus status, const std::string &reason) {

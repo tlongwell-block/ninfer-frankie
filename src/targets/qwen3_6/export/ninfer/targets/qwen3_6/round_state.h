@@ -292,6 +292,9 @@ struct DFlashDecodeState {
 };
 
 struct RoundState {
+    Tensor feature_hidden;
+    std::int32_t feature_layer = -1;
+    std::int32_t feature_columns = 0;
     std::optional<OrdinaryDecodeState> ordinary;
     Tensor token;
     Tensor pos;

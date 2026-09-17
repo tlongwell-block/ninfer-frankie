@@ -458,6 +458,7 @@ struct SharedPrefixSlot {
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
 // gives every occupied request slot its own instance of this state.
 struct RequestControl {
+    bool capture_hidden = false;
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
@@ -668,6 +669,8 @@ public:
     std::vector<SharedPrefixSlot> shared_prefix_slots;
     std::array<std::uint32_t, kMaximumConcurrency> active_continuations{};
     std::array<RequestControl, kMaximumConcurrency> requests;
+    std::array<std::vector<std::uint16_t>, kMaximumConcurrency> pending_feature_rows;
+    void enqueue_feature_rows(std::span<const std::uint32_t> lanes, std::uint32_t width);
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
 
     DecodeGraphFamily ordinary_graphs;

@@ -117,6 +117,16 @@ ninfer_add_test(ninfer_qwen3_6_frontend_test
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+ninfer_add_test(ninfer_qwen3_6_embedded_identity_test
+  SOURCES targets/qwen3_6/test_embedded_prompt_identity.cpp
+          ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/runtime/prefix_identity.cpp
+  LIBRARIES ninfer_core)
+target_include_directories(ninfer_qwen3_6_embedded_identity_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_27b_embeddings_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_embeddings_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_embeddings_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -411,3 +421,17 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+
+if(NINFER_BUILD_FRANKIE)
+  ninfer_add_test(ninfer_frankie_shutdown_test
+    SOURCES test_frankie_shutdown.cpp LIBRARIES Threads::Threads)
+  set_tests_properties(ninfer_frankie_shutdown_test PROPERTIES TIMEOUT 15)
+  ninfer_add_test(ninfer_frankie_options_test
+    SOURCES test_frankie_options.cpp ${PROJECT_SOURCE_DIR}/apps/frankie/options.cpp
+    LIBRARIES ninfer_serve frankie-runtime)
+  target_include_directories(ninfer_frankie_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/frankie)
+  ninfer_add_test(ninfer_frankie_voice_output_test
+    SOURCES ${PROJECT_SOURCE_DIR}/apps/frankie/test-voice-output.cpp
+    LIBRARIES frankie-runtime)
+  set_tests_properties(ninfer_frankie_voice_output_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()

@@ -246,6 +246,11 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     if (prompt.has_media() && !vision_enabled) {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
+    for (const auto& span : prompt.embeddings) {
+        if (span.width != TextConfig::hidden) {
+            throw std::invalid_argument("input embedding width differs from target hidden width");
+        }
+    }
     validate_sampling(options.sampling);
 
     auto base                             = std::make_unique<RequestBasePlanImpl>();
@@ -618,6 +623,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                     continue;
                 }
                 unique.push_back(state);
+                if (!state_exclusive_to_sequence(*source, state)) { continue; }
                 const StateReplicaResidency residency = state_store->residency(state);
                 if (residency == StateReplicaResidency::DeviceOnly ||
                     residency == StateReplicaResidency::Both) {

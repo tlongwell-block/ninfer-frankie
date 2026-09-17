@@ -273,7 +273,6 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
 
 void add_budget(PreprocessStats& stats, const VisionItem& item);
 void enforce_media_item_resource_limits(const PreprocessStats& stats);
-void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options);
 
 // Miss builders run concurrently. Claim their aggregate extent before allocating the retained
 // patch payload so an invalid prompt cannot fill the live-byte account and leave another worker
@@ -413,12 +412,7 @@ std::vector<ChatPart*> media_parts(std::vector<ChatMessage>& messages) {
 
 std::size_t validate_media_inputs(std::span<ChatPart* const> parts,
                                   const ProcessorOptions& options) {
-    const std::uint64_t maximum_items_from_extents =
-        std::min(options.max_raw_patches / kMinimumRawPatchesPerItem, options.max_vision_tokens);
-    if (std::cmp_greater(parts.size(), maximum_items_from_extents)) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "minimum Vision grids exceed processor extent budget");
-    }
+    enforce_media_resource_limits(PreprocessStats{.media_items = parts.size()}, options);
     std::size_t remaining = options.max_encoded_media_bytes;
     for (const ChatPart* part : parts) {
         if (part->media.bytes.size() > remaining) {
@@ -628,17 +622,6 @@ void enforce_media_item_resource_limits(const PreprocessStats& stats) {
     }
 }
 
-void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options) {
-    if (stats.raw_patches > options.max_raw_patches) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision raw patches exceed processor budget");
-    }
-    if (stats.vision_tokens > options.max_vision_tokens) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision tokens exceed processor budget");
-    }
-}
-
 void assign_positions(ProcessedInput& output,
                       std::span<const EncodedChat::MediaTokenRun> media_runs) {
     const std::size_t length = output.input_ids.size();
@@ -723,6 +706,27 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
 }
 
 } // namespace
+
+void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options) {
+    const std::uint64_t maximum_items_from_extents =
+        std::min(options.max_raw_patches / kMinimumRawPatchesPerItem, options.max_vision_tokens);
+    if (std::cmp_greater(stats.media_items, maximum_items_from_extents)) {
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "minimum Vision grids exceed processor extent budget");
+    }
+    if (stats.media_bytes > options.max_encoded_media_bytes) {
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "request media bytes exceed processor budget");
+    }
+    if (stats.raw_patches > options.max_raw_patches) {
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "vision raw patches exceed processor budget");
+    }
+    if (stats.vision_tokens > options.max_vision_tokens) {
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "vision tokens exceed processor budget");
+    }
+}
 
 std::string PreprocessStats::summary() const {
     std::ostringstream out;

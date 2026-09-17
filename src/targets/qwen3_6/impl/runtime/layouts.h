@@ -41,6 +41,7 @@ struct PersistentLayout {
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
     std::optional<TensorLayout> score_hidden;
+    std::optional<TensorLayout> feature_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
     std::size_t bytes            = 0;
@@ -81,6 +82,7 @@ struct SequencePlanningInputs {
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
+    std::optional<std::uint32_t> hidden_layer;
     int device          = 0;
     ContextCacheOptions context_cache;
 };
@@ -104,6 +106,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
+    std::optional<std::uint32_t> hidden_layer;
     int device          = 0;
     ContextCacheOptions context_cache;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;

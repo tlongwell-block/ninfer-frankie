@@ -128,12 +128,11 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
 
     std::optional<CacheBoundary>* automatic_target = nullptr;
     for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
-        if (!turn->tool_calls.empty()) {
+        if (!turn->tool_calls.empty() || !turn->content.empty()) {
+            // Include the message terminator so the implicit shared snapshot can share the
+            // rolling response checkpoint, instead of spending another recurrent-state image
+            // for a content boundary only a few tokens earlier.
             automatic_target = &turn->cache_boundary_after;
-            break;
-        }
-        if (!turn->content.empty()) {
-            automatic_target = &turn->content.back().cache_boundary_after;
             break;
         }
     }

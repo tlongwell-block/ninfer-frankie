@@ -549,6 +549,74 @@ int test_bounded_tokenizer_prefix() {
                  "bounded tokenizer output is not the exact prefix of unbounded tokenization");
 }
 
+int test_external_embeddings() {
+    const Frontend frontend = FrontendFactory::create_component(resources(), false);
+    ninfer::RawPromptOptions options;
+    options.session_key = "voice-test";
+    options.rewrite_execution_frontiers = {1};
+    options.rewrite_checkpoint = 3;
+    auto prepared = frontend.prepare_embeddings({0,0,0,0},
+        {{1, 2, {1.00390625F, -2.0F, 0.5F, 0.75F}}}, options);
+    const auto& data = FrontendFactory::inspect(prepared);
+    int failures = check(data.embeddings.size() == 1 && data.embedding_identity.size() == 2 &&
+        data.embeddings[0].values == std::vector<std::uint16_t>{0x3f80,0xc000,0x3f00,0x3f40} &&
+        data.identity.rewrite_execution_frontiers == std::vector<std::uint32_t>{1,3} &&
+        data.context_cache.session_key->view() == "voice-test",
+        "external embeddings changed BF16 rounding, positions or session checkpoint identity");
+    const auto rejected = [&](std::vector<ninfer::InputEmbeddingSpan> spans) {
+        try { (void)frontend.prepare_embeddings({0,0,0,0}, std::move(spans), {}); }
+        catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    failures += check(rejected({{1,2,{0.0F}}}), "accepted partial embedding row");
+    failures += check(rejected({{4,1,{0.0F}}}), "accepted embedding beyond prompt");
+    failures += check(rejected({{1,1,{0.0F,1.0F}},{2,1,{2.0F}}}), "accepted overlapping audio spans");
+    failures += check(rejected({{1,1,{std::numeric_limits<float>::quiet_NaN()}}}), "accepted nonfinite embedding");
+    return failures;
+}
+
+int test_prepared_media_aggregate_budget() {
+    ninfer::targets::qwen3_6::FrontendOptions options;
+    options.max_context = 16;
+    const Frontend frontend = FrontendFactory::create_component(resources(), options);
+    ninfer::PromptPreparationStats aggregate;
+    aggregate.media_items = 2;
+    aggregate.media_bytes = ninfer::kMaximumPromptMediaBytes;
+    aggregate.raw_patches = 64;
+    aggregate.vision_tokens = 16;
+    frontend.validate_media_budget(aggregate); // Two individually valid images exactly fill it.
+    const auto rejected = [&](ninfer::PromptPreparationStats stats) {
+        try { frontend.validate_media_budget(stats); }
+        catch (const ninfer::RequestError& error) {
+            return error.kind() == ninfer::RequestErrorKind::MediaBudgetExceeded;
+        }
+        return false;
+    };
+    auto excessive = aggregate;
+    excessive.raw_patches += 32;
+    excessive.vision_tokens += 8;
+    int failures = check(rejected(excessive), "prepared images bypassed aggregate vision budget");
+    excessive = aggregate;
+    ++excessive.media_bytes;
+    failures += check(rejected(excessive), "prepared images bypassed aggregate encoded-byte budget");
+    excessive = aggregate;
+    ++excessive.raw_patches;
+    failures += check(rejected(excessive), "prepared images bypassed aggregate raw-patch budget");
+    excessive = aggregate;
+    ++excessive.vision_tokens;
+    failures += check(rejected(excessive), "prepared images bypassed aggregate token budget");
+    excessive = aggregate;
+    excessive.media_items = 17;
+    failures += check(rejected(excessive), "prepared images bypassed minimum item extent budget");
+    Frontend moved_from = frontend;
+    const Frontend owner = std::move(moved_from);
+    bool empty_rejected = false;
+    try { moved_from.validate_media_budget(aggregate); }
+    catch (const std::logic_error&) { empty_rejected = true; }
+    failures += check(empty_rejected, "moved-from frontend media validation did not reject cleanly");
+    return failures;
+}
+
 int test_context_capacity_guard() {
     ninfer::PromptInput input;
     ninfer::ChatMessage message;
@@ -1089,6 +1157,68 @@ int test_official_resource_guards() {
                   capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
               "Frontend did not expose capabilities from its loaded chat template");
 
+    return failures;
+}
+
+int test_shared_message_and_rolling_frontiers(const Frontend& frontend) {
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage result;
+        result.role = role;
+        result.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return result;
+    };
+    int failures = 0;
+    for (const bool thinking : {false, true}) {
+        for (const bool preserve : {false, true}) {
+            for (const bool next_turn : {false, true}) {
+                ninfer::PromptInput input;
+                input.options.enable_thinking   = thinking;
+                input.options.preserve_thinking = preserve;
+                input.messages.push_back(message(ninfer::ChatRole::User, "Look up x."));
+                auto call              = message(ninfer::ChatRole::Assistant, "");
+                call.reasoning_content = "Use the lookup tool.";
+                call.tool_calls.push_back(ninfer::ToolCall{
+                    .id = "call_x", .name = "lookup", .arguments_json = R"({"key":"x"})"});
+                input.messages.push_back(std::move(call));
+                auto result         = message(ninfer::ChatRole::Tool, R"({"value":7})");
+                result.tool_call_id = "call_x";
+                input.messages.push_back(std::move(result));
+                if (next_turn) {
+                    input.messages.push_back(
+                        message(ninfer::ChatRole::Assistant, "The value is seven."));
+                    input.messages.push_back(
+                        message(ninfer::ChatRole::User, "Explain what that means."));
+                }
+                input.context_cache.allow_engine_automatic_shared_prefixes = false;
+                const auto unmarked = frontend.prepare(input);
+                input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                    .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
+                    .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                    .evidence            = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                    .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary});
+                const auto marked    = frontend.prepare(input);
+                const auto replay    = frontend.prepare(input);
+                const auto& original = FrontendFactory::inspect(unmarked);
+                const auto& data     = FrontendFactory::inspect(marked);
+                const auto& repeated = FrontendFactory::inspect(replay);
+                failures += check(
+                    data.token_ids == original.token_ids && data.token_ids == repeated.token_ids,
+                    "implicit full-message caching changed tool history or exact replay");
+                failures += check(
+                    data.context_cache.opportunities.size() == 1 &&
+                        data.identity.rewrite_checkpoint &&
+                        ((next_turn || preserve)
+                             ? data.context_cache.opportunities.front().frontier ==
+                                   data.identity.rewrite_checkpoint->frontier
+                             : data.context_cache.opportunities.front().frontier >
+                                   data.identity.rewrite_checkpoint->frontier) &&
+                        repeated.identity.rewrite_checkpoint->frontier ==
+                            data.identity.rewrite_checkpoint->frontier,
+                    "cache marker changed completed-turn coalescing or current tool-round rewrite");
+            }
+        }
+    }
     return failures;
 }
 
@@ -2214,6 +2344,8 @@ int main() {
     failures += test_repeated_special_tokens_scan_linearly();
     failures += test_bounded_tokenizer_prefix();
     failures += test_context_capacity_guard();
+    failures += test_external_embeddings();
+    failures += test_prepared_media_aggregate_budget();
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();
     failures += test_assistant_continuation();
@@ -2223,6 +2355,7 @@ int main() {
     failures += test_official_resource_guards();
     failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
+    failures += test_shared_message_and_rolling_frontiers(frontend);
     failures += test_literal_control_tokens_with_media();
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();

@@ -8,6 +8,7 @@
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
 #include "targets/registry.h"
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <algorithm>
 #include <limits>
@@ -119,6 +120,15 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
 }
 
 } // namespace
+
+class PreparedImage::Impl {
+public:
+    targets::qwen3_6::PreparedPromptData data;
+};
+
+std::span<const TokenId> PreparedImage::token_ids() const noexcept {
+    return impl_ ? std::span<const TokenId>(impl_->data.token_ids) : std::span<const TokenId>{};
+}
 
 class PreparedPrompt::Impl {
 public:
@@ -326,6 +336,170 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
         impl_->active);
 }
 
+PreparedPrompt Engine::prepare_embeddings(std::vector<TokenId> token_ids,
+                                          std::vector<InputEmbeddingSpan> embeddings,
+                                          RawPromptOptions options, std::vector<RawImageSpan> images) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    const auto sampling_mode = options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
+    return std::visit([&](const auto& target) -> PreparedPrompt {
+        auto prepared = target->loaded->frontend.prepare_embeddings(
+            std::move(token_ids), std::move(embeddings), std::move(options));
+        auto& data = targets::qwen3_6::PreparedPromptAccess::mutable_view(prepared);
+        std::uint32_t previous_end = 0;
+        std::int32_t rope_delta = 0;
+        std::size_t patch_offset = 0;
+        const auto tokens = data.token_ids.size();
+        for (const auto& span : images) {
+            if (!span.image.impl_) { throw std::invalid_argument("empty prepared image"); }
+            const auto& source = span.image.impl_->data;
+            const auto count = source.token_ids.size();
+            if (span.begin < previous_end || span.begin > tokens || count > tokens - span.begin ||
+                !std::equal(source.token_ids.begin(), source.token_ids.end(), data.token_ids.begin() + span.begin)) {
+                throw std::invalid_argument("image spans must match ordered disjoint image token runs");
+            }
+            for (const auto& row : data.embedding_identity) {
+                if (row.position >= span.begin && row.position < span.begin + count) {
+                    throw std::invalid_argument("image and external embedding spans overlap");
+                }
+            }
+            for (std::size_t axis = 0; axis < 3; ++axis) {
+                for (std::size_t pos = previous_end; pos < span.begin; ++pos) {
+                    data.positions[axis * tokens + pos] = static_cast<std::int32_t>(pos) + rope_delta;
+                }
+                for (std::size_t pos = 0; pos < count; ++pos) {
+                    data.positions[axis * tokens + span.begin + pos] =
+                        static_cast<std::int32_t>(span.begin) + rope_delta + source.positions[axis * count + pos];
+                }
+            }
+            std::copy(source.token_types.begin(), source.token_types.end(), data.token_types.begin() + span.begin);
+            for (auto item : source.vision_items) {
+                item.patch_begin += patch_offset;
+                for (auto& range : item.token_spans) { range.begin += span.begin; }
+                patch_offset += item.patch_count;
+                data.vision_items.push_back(std::move(item));
+            }
+            data.media_payloads.insert(data.media_payloads.end(), source.media_payloads.begin(), source.media_payloads.end());
+            data.prepare.media_items += source.prepare.media_items;
+            data.prepare.media_bytes += source.prepare.media_bytes;
+            data.prepare.raw_patches += source.prepare.raw_patches;
+            data.prepare.vision_tokens += source.prepare.vision_tokens;
+            data.prepare.patch_bytes += source.prepare.patch_bytes;
+            target->loaded->frontend.validate_media_budget(prepared.preparation_stats());
+            previous_end = static_cast<std::uint32_t>(span.begin + count);
+            rope_delta += source.rope_delta;
+        }
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            for (std::size_t pos = previous_end; pos < tokens; ++pos) {
+                data.positions[axis * tokens + pos] = static_cast<std::int32_t>(pos) + rope_delta;
+            }
+        }
+        data.rope_delta = rope_delta;
+        const auto summary = prepared.summary();
+        const auto stats = prepared.preparation_stats();
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(summary, stats, sampling_mode,
+                                                                    std::move(prepared)));
+    }, impl_->active);
+}
+
+PreparedImage Engine::prepare_image(OwnedMedia media, const PreparationControl& control) const {
+    if (media.kind != MediaKind::Image) { throw std::invalid_argument("raw image input must be an image"); }
+    PromptInput input;
+    input.options.enable_thinking = false;
+    input.messages.push_back(ChatMessage{.role=ChatRole::User,
+        .parts={MessagePart{.kind=MessagePartKind::Media, .media=std::move(media)}}});
+    auto prepared = prepare(std::move(input), control);
+    auto data = targets::qwen3_6::PreparedPromptAccess::take(std::move(prepared.impl_->value));
+    if (data.vision_items.size() != 1 || data.vision_items.front().token_spans.size() != 1) {
+        throw std::logic_error("single raw image produced an unexpected vision layout");
+    }
+    const auto span = data.vision_items.front().token_spans.front();
+    if (span.begin == 0 || span.begin + span.count >= data.token_ids.size()) {
+        throw std::logic_error("raw image is missing its delimiter tokens");
+    }
+    const auto start = span.begin - 1;
+    const auto count = span.count + 2;
+    const auto vision_start = tokenize_text("<|vision_start|>");
+    const auto vision_end = tokenize_text("<|vision_end|>");
+    if (vision_start.size() != 1 || vision_end.size() != 1 ||
+        data.token_ids[start] != vision_start.front() ||
+        data.token_ids[start + count - 1] != vision_end.front()) {
+        throw std::logic_error("raw image delimiters do not match the artifact tokenizer");
+    }
+    const auto original_tokens = data.token_ids.size();
+    const auto position_base = data.positions[start];
+    std::vector<std::int32_t> positions(3 * count);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::size_t n = 0; n < count; ++n) {
+            positions[axis * count + n] = data.positions[axis * original_tokens + start + n] - position_base;
+        }
+    }
+    data.token_ids = std::vector<TokenId>(data.token_ids.begin() + start, data.token_ids.begin() + start + count);
+    data.token_types = std::vector<std::uint8_t>(data.token_types.begin() + start, data.token_types.begin() + start + count);
+    data.positions = std::move(positions);
+    const auto last_position = std::max({data.positions[count-1], data.positions[2*count-1], data.positions[3*count-1]});
+    data.rope_delta = last_position + 1 - static_cast<std::int32_t>(count);
+    data.vision_items.front().token_spans.front().begin -= start;
+    data.identity = {};
+    data.context_cache = {};
+    PreparedImage result;
+    auto storage = std::make_shared<PreparedImage::Impl>();
+    storage->data = std::move(data);
+    result.impl_ = std::move(storage);
+    return result;
+}
+
+PromptEvaluation Engine::evaluate_prompt(PreparedPrompt prompt, std::vector<TokenId> logit_ids,
+                                         const CancellationView& cancellation, bool capture_tail_features) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (!prompt.impl_) { throw std::invalid_argument("prepared prompt is empty"); }
+    auto probe = std::make_shared<targets::qwen3_6::PromptLogitProbe>();
+    probe->capture_tail = capture_tail_features;
+    if (capture_tail_features && !impl_->options.hidden_layer) {
+        throw std::invalid_argument("tail features require EngineOptions.hidden_layer");
+    }
+    probe->token_ids = std::move(logit_ids);
+    if (!probe->token_ids.empty()) { (void)prepare_tokens(probe->token_ids, false); }
+    probe->logits.resize(probe->token_ids.size());
+    {
+        auto& data = targets::qwen3_6::PreparedPromptAccess::mutable_view(prompt.impl_->value);
+        const auto frontier = static_cast<std::uint32_t>(data.token_ids.size());
+        if (frontier == 0) { throw std::invalid_argument("cannot evaluate an empty prompt"); }
+        data.logit_probe = probe;
+        // Retain the prompt state, independently of the sampled, unexecuted bonus.
+        data.identity.rewrite_checkpoint = targets::qwen3_6::RewriteCheckpointSpec{
+            targets::qwen3_6::RewriteCheckpointKind::ResponseReplay, frontier};
+        auto& boundaries = data.identity.rewrite_execution_frontiers;
+        if (boundaries.empty() || boundaries.back() != frontier) { boundaries.push_back(frontier); }
+    }
+    RequestOptions options;
+    options.execution.requested_output_tokens = 1;
+    options.output.raw = true;
+    auto generation = generate(std::move(prompt), options, nullptr, cancellation);
+    return PromptEvaluation{std::move(generation), std::move(probe->logits), std::move(probe->features)};
+}
+
+bool Engine::discard_session(std::string_view session_key) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit([&](auto& core) -> bool {
+        using T = std::remove_reference_t<decltype(core)>;
+        if constexpr (std::is_same_v<T, std::unique_ptr<Impl::Core27>> ||
+                      std::is_same_v<T, std::unique_ptr<Impl::Core35>>) {
+            return core->discard_session(session_key);
+        } else { throw std::logic_error("session discard requires a Generation Engine"); }
+    }, impl_->core);
+}
+
+void Engine::with_device_idle(const std::function<void()>& work) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::visit([&](auto& core) {
+        using T = std::remove_reference_t<decltype(core)>;
+        if constexpr (std::is_same_v<T, std::unique_ptr<Impl::Core27>> ||
+                      std::is_same_v<T, std::unique_ptr<Impl::Core35>>) {
+            core->with_device_idle(work);
+        } else { throw std::logic_error("external work requires a Generation Engine"); }
+    }, impl_->core);
+}
+
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
@@ -403,8 +577,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
     if (observation.live_timings) { observation.phase_timings = true; }
+    if (observation.max_queued_tokens != 0) { observation.token_ids = true; }
     if (consumer_mode != OutputConsumerMode::Streaming &&
-        (observation.live_timings || observation.prompt_progress)) {
+        (observation.live_timings || observation.prompt_progress || observation.token_ids || observation.hidden_features)) {
         throw std::invalid_argument("live generation observations require a Streaming consumer");
     }
 
@@ -417,6 +592,11 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         throw RequestError(
             RequestErrorKind::ContextLengthExceeded,
             context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
+    }
+    targets::qwen3_6::PreparedPromptAccess::mutable_view(prompt.impl_->value).capture_hidden =
+        observation.hidden_features;
+    if (observation.hidden_features && !impl_->options.hidden_layer) {
+        throw std::invalid_argument("hidden_features requires EngineOptions.hidden_layer");
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {

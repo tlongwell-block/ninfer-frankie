@@ -445,6 +445,12 @@ exclusive optional resources。Fork 期间借用的 immutable StateImage/KV sour
 optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一 allocation 会被重复收费，并把合法的
 Fork 错判为超出 active guarantee。
 
+Endpoint consumption follows the same rule for retained rewrite and anchor images: only
+source-exclusive replicas contribute optional active entitlement. If the pressure plan removes the
+last external alias, the allocation becomes exclusive to the consumed source and must be included
+in that plan's ownership transfer. Counting the shared replica before transfer, or omitting it
+after transfer, violates materialization's exact resource equality.
+
 ### 6.2 Terminal 与 capture
 
 TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，直到 Program 完成：
@@ -455,6 +461,19 @@ TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，�
 若 Finish 无法形成合法保留终态，必须采用 Discard。Optional capture 可以通过同一 pressure graph 改变
 inactive owners，但只有严格优于 private-only baseline 的完整终态才会提交；否则跳过 shared publication，
 不阻塞 active request，也不改变同一 frontier 原本可执行的 private capture。
+
+An optional zero-prefill shared promotion is skipped while its reused base has an unsettled
+StateImage Fork. The immutable private source remains reusable; its destination becomes valid only
+after the first actual model write. Skipping promotion must neither settle an unwritten destination
+nor fail the active request.
+
+A private rewrite checkpoint (TurnClosure or ResponseReplay) has a separate fallback when its state
+image cannot fit:
+the same bounded capture planner may reclaim inactive cached state at the least complete-post-state
+cost. This protects continuation reuse for newly admitted conversations after image-pool saturation.
+It neither expands configured pools nor reclaims active/borrowed/pinned state. Other optional private
+anchors retain skip semantics. If no legal target fits within the search budget, capture still skips
+and the active request continues.
 
 ### 6.3 Persistent backfill proof
 
@@ -737,6 +756,8 @@ lane 或 open transaction 阻塞，结果为 temporarily blocked。
 
 Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证
 identity 或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
+The private-rewrite fallback uses that same typed capture entrypoint and budget, but selects the
+least costly legal repair without requiring the new private checkpoint to create shared value.
 
 一次 planning problem 中：
 

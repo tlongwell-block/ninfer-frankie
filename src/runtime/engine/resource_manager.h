@@ -545,6 +545,11 @@ public:
             }
         }
         if (exact_shared != nullptr) {
+            private_baseline = program.inspect_capture(offer, exact_shared, nullptr,
+                                                       private_replacement, false);
+        }
+        if (exact_shared != nullptr &&
+            (private_baseline.physically_feasible || !private_baseline.rewrite_checkpoint)) {
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
@@ -561,6 +566,7 @@ public:
             }
             return ActiveCaptureReserveResult::Reserved;
         }
+        if (exact_shared != nullptr) { candidate = private_baseline; }
 
         struct CaptureScenario {
             CaptureAssessment assessment;
@@ -569,6 +575,7 @@ public:
             std::uint64_t replacement_id          = 0;
             std::uint64_t replacement_revision    = 0;
             std::uint32_t stable_ordinal          = 0;
+            bool private_rewrite                  = false;
         };
 
         struct SelectedCapture {
@@ -578,7 +585,10 @@ public:
 
         std::optional<SelectedCapture> selected;
         std::vector<PlanningOwnerRecord> capture_owner_records;
-        if (candidate.publishes_shared) {
+        const bool repair_private = private_baseline.publishes_private &&
+                                    private_baseline.rewrite_checkpoint &&
+                                    !private_baseline.physically_feasible;
+        if (candidate.publishes_shared || repair_private) {
             const bool pressure_evidence =
                 has_shared_candidate_evidence(candidate.shared_evidence,
                                               SharedCandidateEvidence::ExplicitBoundary) ||
@@ -589,6 +599,7 @@ public:
             std::vector<CaptureScenario> scenarios;
             scenarios.reserve(static_cast<std::size_t>(shared_catalog_count_) + 1U);
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+                if (!candidate.publishes_shared) { break; }
                 if (shared_catalog_[slot].state != SharedCatalogState::Vacant) { continue; }
                 scenarios.push_back(CaptureScenario{
                     .assessment       = candidate,
@@ -597,7 +608,7 @@ public:
                 });
                 break;
             }
-            if (pressure_evidence) {
+            if (candidate.publishes_shared && pressure_evidence) {
                 for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
                     SharedCatalogEntry& entry = shared_catalog_[slot];
                     if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
@@ -616,6 +627,13 @@ public:
                         .stable_ordinal       = 1U + slot,
                     });
                 }
+            }
+            if (repair_private) {
+                scenarios.push_back(CaptureScenario{
+                    .assessment      = private_baseline,
+                    .stable_ordinal  = 1U + shared_catalog_count_,
+                    .private_rewrite = true,
+                });
             }
 
             std::vector<typename CapturePlanner::OwnerPolicy> owner_policies;
@@ -729,7 +747,7 @@ public:
                     }
                     return found->id;
                 };
-                if (pressure_evidence) {
+                if (pressure_evidence || scenario.private_rewrite) {
                     private_owners.reserve(catalog_count_);
                     private_owner_ids.reserve(catalog_count_);
                     shared_owners.reserve(shared_catalog_count_);
@@ -778,13 +796,18 @@ public:
                     .blocked_runnable_requests = blocked_runnable_requests,
                     .stable_scenario_ordinal   = scenario.stable_ordinal,
                     .target_budget             = scenario_budget,
+                    .private_rewrite           = scenario.private_rewrite,
                 };
                 std::optional<typename CapturePlanner::Result> planned =
                     capture_planner_.plan(program, cost_model_, input);
                 if (!planned) { continue; }
+                const bool same_policy =
+                    selected && scenario.private_rewrite == selected->scenario.private_rewrite;
                 const bool better =
-                    !selected || planned->net_gain > selected->plan.net_gain ||
-                    (planned->net_gain == selected->plan.net_gain &&
+                    !selected ||
+                    (selected->scenario.private_rewrite && !scenario.private_rewrite) ||
+                    (same_policy && planned->net_gain > selected->plan.net_gain) ||
+                    (same_policy && planned->net_gain == selected->plan.net_gain &&
                      std::tie(planned->stable_scenario_ordinal, planned->stable_target_ordinal) <
                          std::tie(selected->plan.stable_scenario_ordinal,
                                   selected->plan.stable_target_ordinal));
@@ -818,7 +841,7 @@ public:
         ActiveCaptureRecord record{
             .lane                 = lane,
             .publishes_private    = selected->scenario.assessment.publishes_private,
-            .publishes_shared     = true,
+            .publishes_shared     = selected->scenario.assessment.publishes_shared,
             .publication_slot     = selected->scenario.publication_slot,
             .replacement_id       = selected->scenario.replacement_id,
             .replacement_revision = selected->scenario.replacement_revision,
@@ -884,24 +907,26 @@ public:
             }
         }
         if (!selected->plan.pressure) {
-            throw std::logic_error("selected shared capture has no pressure plan");
+            throw std::logic_error("selected capture has no pressure plan");
         }
-        if (record.publication_slot >= shared_catalog_count_) {
+        if (record.publishes_shared && record.publication_slot >= shared_catalog_count_) {
             throw std::logic_error("selected shared publication slot is invalid");
         }
-        const SharedCatalogEntry& publication = shared_catalog_[record.publication_slot];
-        if (record.replacement_id == 0) {
-            if (publication.state != SharedCatalogState::Vacant || publication.id != 0 ||
-                publication.handle || publication.transaction_pins != 0 ||
-                shared_active_edge_count(record.publication_slot) != 0) {
-                throw std::logic_error("selected vacant shared publication slot changed");
+        if (record.publishes_shared) {
+            const SharedCatalogEntry& publication = shared_catalog_[record.publication_slot];
+            if (record.replacement_id == 0) {
+                if (publication.state != SharedCatalogState::Vacant || publication.id != 0 ||
+                    publication.handle || publication.transaction_pins != 0 ||
+                    shared_active_edge_count(record.publication_slot) != 0) {
+                    throw std::logic_error("selected vacant shared publication slot changed");
+                }
+            } else if (publication.state != SharedCatalogState::Catalogued || !publication.handle ||
+                       publication.id != record.replacement_id ||
+                       publication.revision != record.replacement_revision ||
+                       publication.transaction_pins != 0 ||
+                       shared_active_edge_count(record.publication_slot) != 0) {
+                throw std::logic_error("selected shared replacement changed before reservation");
             }
-        } else if (publication.state != SharedCatalogState::Catalogued || !publication.handle ||
-                   publication.id != record.replacement_id ||
-                   publication.revision != record.replacement_revision ||
-                   publication.transaction_pins != 0 ||
-                   shared_active_edge_count(record.publication_slot) != 0) {
-            throw std::logic_error("selected shared replacement changed before reservation");
         }
 
         transaction_.template emplace<ActiveCaptureRecord>(std::move(record));
@@ -910,7 +935,8 @@ public:
         const ContextTransactionReserveStatus reserved =
             program.reserve_active_capture_with_pressure(
                 std::move(offer), nullptr, selected->scenario.replacement, private_replacement,
-                true, std::move(*selected->plan.pressure), cancellation);
+                selected->scenario.assessment.publishes_shared, std::move(*selected->plan.pressure),
+                cancellation);
         if (reserved == ContextTransactionReserveStatus::Aborted) {
             rollback_logical_active_capture(open);
             transaction_.template emplace<std::monostate>();
@@ -978,6 +1004,7 @@ public:
         publication.handle.emplace(std::move(*result.continuation));
         result.continuation.reset();
         publication.session   = active.session;
+        publication.owner_session = active.session;
         publication.retention = active.retention;
         migrate_observations(publication, result.summary, active.retention);
         advance_revision(publication.revision);
@@ -1121,6 +1148,33 @@ public:
         return lane.value < lane_count_ ? lanes_[lane.value] : LogicalLaneState::Free;
     }
 
+    // Call between execution units after the session's requests have settled.
+    // A retained prefix may still be borrowed by another active request.
+    [[nodiscard]] bool discard_session(Program& program, const CacheSessionKey& session) {
+        if (!std::holds_alternative<std::monostate>(transaction_) ||
+            program.has_context_transaction()) { return false; }
+        for (const ActiveEntry& active : active_) {
+            if (active.occupied && active.session && *active.session == session) { return false; }
+        }
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (!entry.owner_session || *entry.owner_session != session) { continue; }
+            if (entry.state != CatalogState::Catalogued || !entry.handle || private_has_active_edge(slot)) {
+                return false;
+            }
+        }
+        for (CatalogEntry& entry : catalog_) {
+            if (!entry.owner_session || *entry.owner_session != session) { continue; }
+            const auto result = program.release_continuation(std::move(*entry.handle));
+            if (result.status != ConsumeStatus::Consumed) {
+                throw std::runtime_error("session checkpoint release invariant mismatch");
+            }
+            erase_session_if_owner(entry.id);
+            clear_catalog_entry(entry);
+        }
+        return true;
+    }
+
     void clear_after_program_cleanup() noexcept {
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
@@ -1157,6 +1211,7 @@ private:
         ContinuationSummary summary;
         std::optional<ContinuationHandle> handle;
         std::optional<CacheSessionKey> session;
+        std::optional<CacheSessionKey> owner_session; // Kept when a newer endpoint replaces the session binding.
         std::vector<CheckpointObservation> observations;
         RetentionClass retention = RetentionClass::RecentPrivate;
     };
@@ -1557,6 +1612,7 @@ private:
         entry.summary.active_references = 0;
         entry.handle.reset();
         entry.session.reset();
+        entry.owner_session.reset();
         entry.observations.clear();
         entry.retention = RetentionClass::RecentPrivate;
         advance_revision(entry.revision);
@@ -2301,7 +2357,9 @@ private:
         for (const OwnerClaim& claim : record.shared_claims) {
             shared_catalog_[claim.capability.slot].state = SharedCatalogState::Claimed;
         }
-        shared_catalog_[record.publication_slot].state = SharedCatalogState::ReservedCapture;
+        if (record.publishes_shared) {
+            shared_catalog_[record.publication_slot].state = SharedCatalogState::ReservedCapture;
+        }
     }
 
     void rollback_logical_active_capture(const ActiveCaptureRecord& record) noexcept {
@@ -2311,9 +2369,11 @@ private:
         for (const OwnerClaim& claim : record.shared_claims) {
             shared_catalog_[claim.capability.slot].state = SharedCatalogState::Catalogued;
         }
-        shared_catalog_[record.publication_slot].state = record.replacement_id == 0
-                                                             ? SharedCatalogState::Vacant
-                                                             : SharedCatalogState::Catalogued;
+        if (record.publishes_shared) {
+            shared_catalog_[record.publication_slot].state = record.replacement_id == 0
+                                                                 ? SharedCatalogState::Vacant
+                                                                 : SharedCatalogState::Catalogued;
+        }
     }
 
     void observe_selected_hit(const MaterializationRecord& record) noexcept {
@@ -2893,6 +2953,7 @@ private:
         publication.state         = CatalogState::ReservedForActive;
         publication.id            = next_continuation_id_++;
         publication.session       = record->session;
+        publication.owner_session = record->session;
         publication.retention     = record->retention;
         advance_revision(publication.revision);
         if (publication.id == 0) { publication.id = next_continuation_id_++; }

@@ -115,7 +115,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
-ServeOptions parse_serve_options(int argc, char** argv) {
+ServeOptions parse_serve_options(int argc, char** argv, const ExtraOptionParser& extra) {
     ServeOptions options;
     options.startup_argv.reserve(static_cast<std::size_t>(argc));
     bool redact_next = false;
@@ -317,6 +317,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.greedy = true;
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(require_value("--log-level"));
+        } else if (extra && extra(arg, i, argc, argv)) {
+            // The extension consumed its own value after native options were parsed.
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }

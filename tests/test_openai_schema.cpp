@@ -343,6 +343,20 @@ int test_tools() {
                           mixed_prompt.context_cache.markers.back().after_message_count == 2,
                       "automatic caching stops after a complete assistant text/tool-call turn");
 
+    for (const Json& messages : {base_request().at("messages"), history.at("messages")}) {
+        Json request_body                  = base_request();
+        request_body["messages"]           = messages;
+        const GenerationRequest generation = parse(request_body).generation;
+        const auto translated              = prompt(generation);
+        failures += check(generation.messages.back().cache_boundary_after &&
+                              !generation.messages.back().content.back().cache_boundary_after &&
+                              translated.context_cache.markers.back().location ==
+                                  ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                              translated.context_cache.markers.back().after_message_count ==
+                                  generation.messages.size(),
+                          "implicit caching includes the complete user or tool-result message");
+    }
+
     const Json ordered = Json::parse(
         R"({"model":"qwen","messages":[{"role":"user","content":"probe"}],"tools":[{"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}}}]})");
     const ninfer::PromptInput ordered_prompt = prompt(parse(ordered).generation);

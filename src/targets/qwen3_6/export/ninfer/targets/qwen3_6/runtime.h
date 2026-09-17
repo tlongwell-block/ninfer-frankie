@@ -745,6 +745,7 @@ struct CaptureAssessment {
     std::vector<runtime::CheckpointRef> private_replacement_candidates;
     std::uint32_t frontier                = 0;
     bool publishes_private                = false;
+    bool rewrite_checkpoint               = false;
     bool publishes_shared                 = false;
     bool needs_transfer                   = false;
     bool physically_feasible              = false;
@@ -819,6 +820,7 @@ using ContextTransactionProgress =
                  ActiveCaptureResult<Variant>>;
 
 struct CommitRowResult {
+    CommittedTokenFeatures features;
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
     GenerationTimings timings;
     SpeculativeStats speculative;

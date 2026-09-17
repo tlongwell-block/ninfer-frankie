@@ -55,6 +55,17 @@ bool prefix_item_count(const std::vector<VisionItem>& items, std::size_t tokens,
     return true;
 }
 
+bool same_embedding_prefix(const std::vector<EmbeddingRowIdentity>& a,
+                           const std::vector<EmbeddingRowIdentity>& b, std::size_t count) {
+    const auto end = [count](const auto& rows) {
+        return std::lower_bound(rows.begin(), rows.end(), count,
+            [](const auto& row, std::size_t n) { return row.position < n; });
+    };
+    const auto ae = end(a), be = end(b);
+    return std::distance(a.begin(), ae) == std::distance(b.begin(), be) &&
+           std::equal(a.begin(), ae, b.begin());
+}
+
 using DigestPair = std::array<std::uint64_t, 2>;
 
 constexpr DigestPair kDigestOffset{1469598103934665603ULL, 7809847782465536322ULL};
@@ -142,6 +153,7 @@ void ResidentPrefixIdentity::clear() noexcept {
     token_types_.clear();
     for (auto& axis : positions_) { axis.clear(); }
     vision_items_.clear();
+    embedding_identity_.clear();
     rewrite_execution_frontiers_.clear();
 }
 
@@ -156,6 +168,7 @@ void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
         positions_[axis].assign(begin, begin + static_cast<std::ptrdiff_t>(tokens));
     }
     vision_items_                = prompt.vision_items;
+    embedding_identity_ = prompt.embedding_identity;
     rewrite_execution_frontiers_ = prompt.identity.rewrite_execution_frontiers;
 }
 
@@ -163,6 +176,7 @@ void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
     token_types_.swap(other.token_types_);
     positions_.swap(other.positions_);
     vision_items_.swap(other.vision_items_);
+    embedding_identity_.swap(other.embedding_identity_);
     rewrite_execution_frontiers_.swap(other.rewrite_execution_frontiers_);
 }
 
@@ -211,6 +225,7 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
     token_types_.resize(tokens);
     for (auto& axis : positions_) { axis.resize(tokens); }
     vision_items_.resize(retained_items);
+    std::erase_if(embedding_identity_, [tokens](const auto& row) { return row.position >= tokens; });
     rewrite_execution_frontiers_.erase(std::upper_bound(rewrite_execution_frontiers_.begin(),
                                                         rewrite_execution_frontiers_.end(), tokens),
                                        rewrite_execution_frontiers_.end());
@@ -236,6 +251,7 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
         }
     }
 
+    if (!same_embedding_prefix(embedding_identity_, prompt.embedding_identity, count)) { return false; }
     std::size_t incoming_items = 0;
     std::size_t resident_items = 0;
     if (!prefix_item_count(prompt.vision_items, count, &incoming_items) ||
@@ -275,6 +291,7 @@ bool ResidentPrefixIdentity::prefix_equals(const ResidentPrefixIdentity& other,
             return false;
         }
     }
+    if (!same_embedding_prefix(embedding_identity_, other.embedding_identity_, count)) { return false; }
     std::size_t left_items  = 0;
     std::size_t right_items = 0;
     if (!prefix_item_count(vision_items_, count, &left_items) ||
@@ -321,6 +338,7 @@ void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
     digests_.push_back(kDigestOffset);
     std::size_t next_rewrite = 0;
     std::size_t next_vision  = 0;
+    std::size_t next_embedding = 0;
     std::size_t next_vision_end =
         prompt.vision_items.empty() ? 0 : checked_vision_end(prompt.vision_items.front(), tokens);
     for (std::size_t index = 0; index < tokens; ++index) {
@@ -329,6 +347,13 @@ void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
                                                     prompt.positions[2U * tokens + index]};
         append_digest(digests_, prompt.token_ids[index], prompt.token_types[index], positions,
                       prompt.identity.rewrite_execution_frontiers, next_rewrite);
+        if (next_embedding < prompt.embedding_identity.size() &&
+            prompt.embedding_identity[next_embedding].position == index) {
+            const auto& row = prompt.embedding_identity[next_embedding++];
+            mix_digest(digests_.back(), 0x6e696e6665722d65ULL);
+            mix_digest(digests_.back(), row.width);
+            for (auto byte : row.digest) { mix_digest(digests_.back(), byte); }
+        }
         const std::size_t frontier = index + 1U;
         while (next_vision < prompt.vision_items.size() && next_vision_end == frontier) {
             mix_vision_item(digests_.back(), prompt.vision_items[next_vision]);

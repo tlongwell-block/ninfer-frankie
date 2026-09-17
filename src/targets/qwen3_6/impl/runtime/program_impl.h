@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <exception>
 #include <iterator>
@@ -930,6 +931,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
+    if (plan.persistent.feature_hidden) {
+        io.feature_hidden = plan.persistent.feature_hidden->bind(backing);
+        io.feature_layer = static_cast<std::int32_t>(*plan.hidden_layer);
+    }
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }
@@ -1308,7 +1313,8 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
                 state_store->checkpoint_references(*protection.state) !=
                 protection.consumed_state_references;
 
-            if (is_rewrite_checkpoint_restore(admission.reuse)) {
+            if (admission.reuse == ReusePath::PrivateEndpoint ||
+                is_rewrite_checkpoint_restore(admission.reuse)) {
                 const auto append_optional_state = [&](StateImageHandle state) {
                     if (!state_store->valid(state) || state_exclusive_to_sequence(source, state) ||
                         std::any_of(
@@ -1327,7 +1333,8 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
                     append_optional_state(*source.rewrite_state);
                 }
                 for (const LongAnchorCheckpoint& anchor : source.long_anchors) {
-                    if (anchor.frontier <= admission.reuse_base) {
+                    if (admission.reuse == ReusePath::PrivateEndpoint ||
+                        anchor.frontier <= admission.reuse_base) {
                         append_optional_state(anchor.state);
                     }
                 }
@@ -7408,6 +7415,7 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
         validated_rebuild_work(group.identity->rebuild_work, group.frontier);
     assessment.frontier          = group.frontier;
     assessment.publishes_private = publish_private;
+    assessment.rewrite_checkpoint = group.rewrite.has_value();
     assessment.publishes_shared  = publish_shared;
     if (!publish_private && !publish_shared) {
         if (private_replacement) {
@@ -7707,7 +7715,8 @@ ProgramImplCore::checkpoint_recovery_work(const SharedPrefixHandle& owner,
 
 std::unique_ptr<CapturePressureCandidateImpl>
 ProgramImplCore::make_capture_physical_candidate(const CaptureAssessment& assessment) const {
-    if (assessment.implementation == nullptr || !assessment.publishes_shared ||
+    if (assessment.implementation == nullptr ||
+        (!assessment.publishes_shared && !assessment.rewrite_checkpoint) ||
         assessment.frontier == 0) {
         throw std::invalid_argument("capture pressure candidate is incomplete");
     }
@@ -9127,6 +9136,25 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
                 }
             }
 
+            if (!decisions[row].cancelled && pending_kinds[row] != PendingKind::Begin &&
+                requests[lanes[row]].capture_hidden) {
+                const auto& sequence = active_sequence(lanes[row]);
+                const auto count = decisions[row].accepted_tokens;
+                auto& features = out.rows[row].features;
+                features.begin = sequence.execution_frontier - count;
+                features.width = TextConfig::hidden;
+                features.layer = static_cast<std::uint32_t>(io.feature_layer);
+                features.token_ids.assign(sequence.ledger.begin() + features.begin,
+                                          sequence.ledger.begin() + sequence.execution_frontier);
+                const auto& source = pending_feature_rows[lanes[row]];
+                if (source.size() < static_cast<std::size_t>(count) * TextConfig::hidden) {
+                    throw std::logic_error("committed feature rows exceed target execution");
+                }
+                features.values.reserve(static_cast<std::size_t>(count) * TextConfig::hidden);
+                for (std::size_t n = 0; n < static_cast<std::size_t>(count) * TextConfig::hidden; ++n) {
+                    features.values.push_back(std::bit_cast<float>(static_cast<std::uint32_t>(source[n]) << 16));
+                }
+            }
             if (pending_kinds[row] != PendingKind::Begin || decisions[row].cancelled) { continue; }
             RequestControl& request = requests[lanes[row]];
             if (decisions[row].terminal) {
@@ -9948,6 +9976,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         request.timings              = {};
         request.pending              = {};
         request.publish_continuation = request_plan.summary.publish_continuation;
+        request.capture_hidden = staged.prompt.capture_hidden;
         sequence.mtp_draft_count     = 0;
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.swap(materialization_ledger_);
@@ -11445,12 +11474,20 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 staged.capture_groups[staged.next_capture].long_anchor) {
                 throw std::logic_error("zero-prefill capture is not a shared base promotion");
             }
-            if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
-            staged.pending_capture_offer = next_capture_offer_id_;
-            return runtime::PrefillStepResult{
-                .summary = summary,
-                .timing  = timing.finish(),
-            };
+            if (sequence.state.fork_pending) {
+                // The reusable checkpoint still owns the immutable source; the destination
+                // becomes valid only after the first actual prefill/decode write. Keep using
+                // that checkpoint and omit this optional promotion instead of opening a
+                // resource transaction while its Fork is unsettled.
+                ++staged.next_capture;
+            } else {
+                if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
+                staged.pending_capture_offer = next_capture_offer_id_;
+                return runtime::PrefillStepResult{
+                    .summary = summary,
+                    .timing  = timing.finish(),
+                };
+            }
         }
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
@@ -11497,14 +11534,17 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 const TokenId token = staged.prompt.token_ids[staged.base];
                 CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
                                            cudaMemcpyHostToDevice, device.stream));
+                Tensor embedding = schedule::external_embedding_at(schedule_state, staged.prompt, staged.base);
                 schedule::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
-                                                 bridge.position, bridge.rope_position, false);
+                                                 bridge.position, bridge.rope_position, false,
+                                                 embedding.data ? &embedding : nullptr);
             }
             sequence.mtp_kv_valid = staged.base;
             commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
             staged.mtp_bridge = MtpBridgeMode::None;
         }
 
+        std::uint32_t final_chunk_tokens = 0;
         if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
@@ -11514,7 +11554,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 mark_workspace_usage(workspace_plan.dflash_context);
             }
             std::uint32_t remaining          = nominal;
-            std::uint32_t final_chunk_tokens = 0;
             bool finalized                   = false;
             while (remaining != 0) {
                 schedule_state.text_kv_base           = staged.cursor;
@@ -11556,7 +11595,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 } else {
                     result = schedule::prefill_text_chunk(
                         schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
-                        remaining, split_frontier, final_candidate);
+                        remaining, split_frontier, final_candidate, &staged.prompt);
                 }
                 timing.include(result.timing);
                 timing.resume_post();
@@ -11645,6 +11684,32 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             }
         }
 
+        std::vector<std::uint16_t> tail_feature;
+        if (staged.prompt.logit_probe && staged.prompt.logit_probe->capture_tail && final_chunk_tokens != 0) {
+            tail_feature.resize(TextConfig::hidden);
+            const auto* source = static_cast<const std::uint16_t*>(io.feature_hidden.data) +
+                                  static_cast<std::size_t>(io.feature_columns - 1) * TextConfig::hidden;
+            CUDA_CHECK(cudaMemcpyAsync(tail_feature.data(), source, tail_feature.size() * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToHost, device.stream));
+        }
+        std::vector<std::uint16_t> probe_bf16;
+        if (staged.prompt.logit_probe && !staged.prompt.logit_probe->token_ids.empty()) {
+            auto& probe = *staged.prompt.logit_probe;
+            // MTP prefill reuses io.logits for its draft head. Probe the TARGET head explicitly.
+            Tensor logits = io.logits.slice(1, 0, 1);
+            ops::linear(sequence.tail_hidden, model.output_head, logits, device.stream);
+            if (logits.dtype != DType::BF16) { throw std::logic_error("prompt logits must be BF16"); }
+            probe_bf16.resize(probe.token_ids.size());
+            for (std::size_t index = 0; index < probe.token_ids.size(); ++index) {
+                const auto token = probe.token_ids[index];
+                if (token < 0 || token >= logits.ne[0]) {
+                    throw std::invalid_argument("prompt probe token lies outside model logits");
+                }
+                CUDA_CHECK(cudaMemcpyAsync(&probe_bf16[index],
+                    static_cast<const std::uint16_t*>(logits.data) + token, sizeof(std::uint16_t),
+                    cudaMemcpyDeviceToHost, device.stream));
+            }
+        }
         copy_round_token();
         std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> initial_drafts{};
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
@@ -11655,6 +11720,20 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         timing.begin_wait();
         device.synchronize();
         timing.end_wait();
+        for (std::size_t index = 0; index < probe_bf16.size(); ++index) {
+            staged.prompt.logit_probe->logits[index] =
+                std::bit_cast<float>(static_cast<std::uint32_t>(probe_bf16[index]) << 16);
+        }
+        if (!tail_feature.empty()) {
+            auto& feature = staged.prompt.logit_probe->features;
+            feature.begin = staged.prompt_tokens - 1;
+            feature.width = TextConfig::hidden;
+            feature.layer = static_cast<std::uint32_t>(io.feature_layer);
+            feature.token_ids = {staged.prompt.token_ids.back()};
+            for (auto value : tail_feature) {
+                feature.values.push_back(std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16));
+            }
+        }
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
@@ -11711,6 +11790,21 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         const std::uint32_t lane = sequence.lane;
         clear_execution_failure_lanes(std::span<const std::uint32_t>(&lane, 1));
         throw;
+    }
+}
+
+void ProgramImplCore::enqueue_feature_rows(std::span<const std::uint32_t> lanes, std::uint32_t width) {
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        auto& host = pending_feature_rows[lanes[row]];
+        host.clear();
+        if (!requests[lanes[row]].capture_hidden) { continue; }
+        if (io.feature_hidden.data == nullptr) {
+            throw std::logic_error("request feature capture requires Engine hidden_layer");
+        }
+        host.resize(static_cast<std::size_t>(width) * TextConfig::hidden);
+        const auto* source = static_cast<const std::uint16_t*>(io.feature_hidden.data) + row * host.size();
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), source, host.size() * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, device.stream));
     }
 }
 
@@ -11797,6 +11891,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
+        enqueue_feature_rows(lanes, 1);
         submit_range.reset();
         timing.begin_wait();
         {
@@ -11957,6 +12052,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
+        enqueue_feature_rows(lanes, width);
         submit_range.reset();
         timing.begin_wait();
         {
